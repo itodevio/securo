@@ -31,9 +31,10 @@ Setup (one-time, in IBKR Client Portal):
 Connecting in Securo: this provider uses the generic paste-a-token flow
 (same contract as SimpleFIN's ``handle_oauth_callback``). Since we need two
 values (Token + Query ID) and the API only carries one opaque ``code``
-string, we accept them as ``token:queryId`` (colon-separated). There is no
-dedicated frontend form for this provider yet — connect it directly via the
-API, e.g.:
+string, we accept them as ``token:queryId`` (colon-separated). The frontend's
+TokenConnectDialog (see token-connect-dialog.tsx) surfaces provider-specific
+copy for this format via the ``accounts.tokenConnect.ibkr_flex.*`` i18n keys.
+It can also be connected directly via the API, e.g.:
 
     curl -X POST https://finance.yourdomain/api/connections/oauth/callback \\
       -H "Content-Type: application/json" \\
@@ -41,8 +42,7 @@ API, e.g.:
       -d '{"provider": "ibkr_flex", "code": "<TOKEN>:<QUERY_ID>"}'
 
 (Get the session cookie from your browser's dev tools while logged into
-Securo, or add a small form to ConnectBankDialog.tsx following the SimpleFIN
-token-paste UI as a reference.)
+Securo.)
 """
 from __future__ import annotations
 
