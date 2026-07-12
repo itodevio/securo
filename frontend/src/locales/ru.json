@@ -607,6 +607,14 @@
         "title": "Подключение через SimpleFIN",
         "description": "SimpleFIN — это протокол банковских данных только для чтения. Перейдите в SimpleFIN Bridge, выберите свой банк и скопируйте установочный токен сюда."
       },
+      "ibkr_flex": {
+        "title": "Подключение через Interactive Brokers (Flex Query)",
+        "description": "В Client Portal IBKR перейдите в Settings > Reporting > Flex Web Service, чтобы создать токен, и запишите Query ID вашего Activity Flex Query.",
+        "openBridge": "Руководство по настройке Flex Web Service",
+        "tokenLabel": "Токен и Query ID",
+        "tokenPlaceholder": "TOKEN:QUERY_ID",
+        "tokenHelp": "Вставьте токен Flex Web Service и числовой Query ID через двоеточие, например 123abc456:789012."
+      },
       "reconnectTitle": "Переподключить с новым токеном",
       "reconnectDescription": "Вставьте новый setup-токен, чтобы обновить это подключение на месте. Существующие счета, транзакции, категории и правила сохранятся.",
       "reconnect": "Переподключить"
@@ -620,6 +628,9 @@
       },
       "simplefin": {
         "description": "Банки США и других стран через SimpleFIN Bridge"
+      },
+      "ibkr_flex": {
+        "description": "Позиции и денежные средства IBKR через Flex Web Service (пользовательский провайдер для личного использования)"
       }
     },
     "reconnected": "Банк успешно переподключён"
