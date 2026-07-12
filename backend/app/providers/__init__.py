@@ -41,6 +41,14 @@ KNOWN_PROVIDERS = [
         "requires_institution_select": False,
         "supports_asset_sync": True,
     },
+    {
+        "name": "ibkr_flex",
+        "display_name": "Interactive Brokers (Flex Query)",
+        "description": "IBKR positions/cash via the Flex Web Service (custom, personal-use provider)",
+        "flow_type": "token",
+        "requires_institution_select": False,
+        "supports_asset_sync": True,
+    },
 ]
 
 
@@ -93,6 +101,10 @@ def _auto_register_providers() -> None:
     if settings.simplefin_enabled:
         from app.providers.simplefin import SimpleFinProvider
         register_provider("simplefin", SimpleFinProvider)
+
+    if settings.ibkr_flex_enabled:
+        from app.providers.ibkr_flex import IbkrFlexProvider
+        register_provider("ibkr_flex", IbkrFlexProvider)
 
 
 _auto_register_providers()
