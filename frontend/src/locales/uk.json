@@ -1069,6 +1069,10 @@
     "syncedFromHint": "Початково синхронізовано з {{source}} — ви можете вільно перейменовувати, зіставлення використовує ID підключення.",
     "chartByWallet": "За гаманцями",
     "chartByAsset": "За активами",
+    "chartGroupMode": "Групування графіка",
+    "chartDrawMode": "Відображення графіка",
+    "chartStacked": "Накопичено",
+    "chartLines": "Лінії",
     "portfolioValue": "Вартість портфеля",
     "total": "Усього",
     "confirmRegenerateTitle": "Перегенерувати значення?",
@@ -1149,6 +1153,8 @@
     "range30d": "30Д"
   },
   "payees": {
+    "addFavorite": "Додати до обраного",
+    "removeFavorite": "Видалити з обраного",
     "title": "Отримувачі",
     "section": "Налаштування",
     "payee": "Отримувач",
@@ -1184,6 +1190,7 @@
     "favoritesOnly": "Тільки обрані"
   },
   "common": {
+    "view": "Переглянути",
     "save": "Зберегти",
     "cancel": "Скасувати",
     "close": "Закрити",
@@ -1300,6 +1307,8 @@
     "date": "Дата",
     "splitTransaction": "Розділити цю транзакцію",
     "splitNoGroups": "Спочатку створіть групу, щоб розділити транзакцію.",
+    "splitNoGroupsLinkPrefix": "У вас ще немає групи. Ви можете ",
+    "splitNoGroupsLinkSuffix": "створити її тут",
     "splitNoMembers": "Спочатку додайте учасників до групи.",
     "group": "Група",
     "shareType": "Розділити за",
