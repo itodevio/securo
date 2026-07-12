@@ -44,6 +44,11 @@ class Settings(BaseSettings):
     simplefin_enabled: bool = False
     simplefin_api_url: str = "https://beta-bridge.simplefin.org"
 
+    # Interactive Brokers Flex Query (custom, personal-use provider — not
+    # part of upstream Securo). Off by default; paste-a-token flow like
+    # SimpleFIN. See app/providers/ibkr_flex.py for setup instructions.
+    ibkr_flex_enabled: bool = False
+
     # Frontend
     frontend_url: str = "http://localhost:5173"
 
