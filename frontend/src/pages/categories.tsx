@@ -264,8 +264,8 @@ export default function CategoriesPage() {
 
       {/* Category Dialog */}
       <Dialog open={catDialogOpen} onOpenChange={() => { setCatDialogOpen(false); setEditingCat(null) }}>
-        <DialogContent>
-          <DialogHeader>
+        <DialogContent className="flex flex-col max-h-[calc(100dvh-2rem)] overflow-hidden">
+          <DialogHeader className="shrink-0">
             <DialogTitle>{editingCat ? t('categories.editCategory') : t('categories.newCategory')}</DialogTitle>
           </DialogHeader>
           <form
@@ -287,7 +287,7 @@ export default function CategoriesPage() {
                 createCatMutation.mutate(data)
               }
             }}
-            className="space-y-4"
+            className="space-y-4 overflow-y-auto flex-1 min-h-0 -mx-1 px-1"
           >
             <div className="space-y-2">
               <Label>{t('groups.name')}</Label>
@@ -353,8 +353,8 @@ export default function CategoriesPage() {
 
       {/* Group Dialog */}
       <Dialog open={groupDialogOpen} onOpenChange={() => { setGroupDialogOpen(false); setEditingGroup(null) }}>
-        <DialogContent>
-          <DialogHeader>
+        <DialogContent className="flex flex-col max-h-[calc(100dvh-2rem)] overflow-hidden">
+          <DialogHeader className="shrink-0">
             <DialogTitle>{editingGroup ? t('groups.edit') : t('groups.new')}</DialogTitle>
           </DialogHeader>
           <form
@@ -374,7 +374,7 @@ export default function CategoriesPage() {
                 createGroupMutation.mutate(data)
               }
             }}
-            className="space-y-4"
+            className="space-y-4 overflow-y-auto flex-1 min-h-0 -mx-1 px-1"
           >
             <div className="space-y-2">
               <Label>{t('groups.name')}</Label>
