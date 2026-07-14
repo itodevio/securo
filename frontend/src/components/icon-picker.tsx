@@ -32,7 +32,7 @@ export function IconPicker({ value, color, onChange }: IconPickerProps) {
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
-      <div className="grid grid-cols-8 gap-1.5 max-h-48 overflow-y-auto p-1">
+      <div className="grid grid-cols-[repeat(auto-fill,minmax(2.25rem,1fr))] gap-1.5 max-h-48 overflow-y-auto p-1">
         {filtered.map((entry) => {
           const isSelected = value === entry.name
           const Icon = entry.icon

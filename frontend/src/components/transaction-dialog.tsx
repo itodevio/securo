@@ -168,7 +168,7 @@ export function TransactionDialog({
         hasPreview ? 'sm:max-w-5xl max-w-2xl' : 'sm:max-w-2xl max-w-2xl'
       )}>
         <div className={isEditing
-          ? 'flex flex-col min-h-0 flex-1 sm:flex-row sm:flex-none sm:gap-0 sm:h-[80vh]'
+          ? 'flex flex-col min-h-0 flex-1 sm:flex-row sm:flex-none sm:gap-0 sm:h-[80dvh]'
           : 'flex flex-col min-h-0 flex-1'}>
           {/* Left column: form */}
           <div className={isEditing

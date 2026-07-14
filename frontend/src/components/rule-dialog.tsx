@@ -128,7 +128,7 @@ export function RuleDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto overflow-x-hidden">
+      <DialogContent className="max-w-2xl max-h-[calc(100dvh-2rem)] overflow-y-auto overflow-x-hidden">
         <DialogHeader>
           <DialogTitle>{rule ? t('rules.editRule') : t('rules.newRule')}</DialogTitle>
         </DialogHeader>
@@ -167,9 +167,9 @@ export function RuleDialog({
             </div>
             <div className="space-y-2">
               {conditions.map((cond, i) => (
-                <div key={i} className="flex items-center gap-2 min-w-0">
+                <div key={i} className="flex flex-wrap sm:flex-nowrap items-center gap-2 min-w-0">
                   <select
-                    className={`${selectClass} w-32 shrink-0`}
+                    className={`${selectClass} flex-1 min-w-[6rem] sm:flex-none sm:w-32 sm:shrink-0`}
                     value={cond.field}
                     onChange={(e) => updateCondition(i, 'field', e.target.value)}
                   >
@@ -178,7 +178,7 @@ export function RuleDialog({
                     ))}
                   </select>
                   <select
-                    className={`${selectClass} w-32 shrink-0`}
+                    className={`${selectClass} flex-1 min-w-[6rem] sm:flex-none sm:w-32 sm:shrink-0`}
                     value={cond.op}
                     onChange={(e) => updateCondition(i, 'op', e.target.value)}
                   >
@@ -188,7 +188,7 @@ export function RuleDialog({
                   </select>
                   {cond.field === 'type' ? (
                     <select
-                      className={`${selectClass} w-0 flex-1 min-w-0`}
+                      className={`${selectClass} w-full sm:w-0 sm:flex-1 min-w-0`}
                       value={String(cond.value)}
                       onChange={(e) => updateCondition(i, 'value', e.target.value)}
                     >
@@ -197,7 +197,7 @@ export function RuleDialog({
                     </select>
                   ) : cond.field === 'account_id' ? (
                     <select
-                      className={`${selectClass} w-0 flex-1 min-w-0`}
+                      className={`${selectClass} w-full sm:w-0 sm:flex-1 min-w-0`}
                       value={String(cond.value)}
                       onChange={(e) => updateCondition(i, 'value', e.target.value)}
                     >
@@ -208,7 +208,7 @@ export function RuleDialog({
                     </select>
                   ) : cond.field === 'payee_id' ? (
                     <select
-                      className={`${selectClass} w-0 flex-1 min-w-0`}
+                      className={`${selectClass} w-full sm:w-0 sm:flex-1 min-w-0`}
                       value={String(cond.value)}
                       onChange={(e) => updateCondition(i, 'value', e.target.value)}
                     >
@@ -219,7 +219,7 @@ export function RuleDialog({
                     </select>
                   ) : (
                     <Input
-                      className="w-0 flex-1 min-w-0 h-8 text-sm"
+                      className="w-full sm:w-0 sm:flex-1 min-w-0 h-8 text-sm"
                       value={String(cond.value)}
                       onChange={(e) => updateCondition(i, 'value', e.target.value)}
                       placeholder={cond.field === 'amount' ? '0.00' : cond.field === 'date' ? 'YYYY-MM-DD' : t('rules.valuePlaceholder')}
@@ -250,9 +250,9 @@ export function RuleDialog({
             <Label>{t('rules.actions')}</Label>
             <div className="space-y-2">
               {actions.map((action, i) => (
-                <div key={i} className="flex items-center gap-2 min-w-0">
+                <div key={i} className="flex flex-wrap sm:flex-nowrap items-center gap-2 min-w-0">
                   <select
-                    className={`${selectClass} w-40 shrink-0`}
+                    className={`${selectClass} flex-1 min-w-[8rem] sm:flex-none sm:w-40 sm:shrink-0`}
                     value={action.op}
                     onChange={(e) => updateAction(i, 'op', e.target.value)}
                   >
@@ -262,11 +262,11 @@ export function RuleDialog({
                     <option value="ignore">{t('rules.ignoreAction')}</option>
                   </select>
                   {action.op === 'ignore' ? (
-                    <span className="w-0 flex-1 min-w-0 text-sm text-muted-foreground italic">
+                    <span className="w-full sm:w-0 sm:flex-1 min-w-0 text-sm text-muted-foreground italic">
                       {t('rules.ignoreActionHint')}
                     </span>
                   ) : action.op === 'set_category' ? (
-                    <div className="w-0 flex-1 min-w-0">
+                    <div className="w-full sm:w-0 sm:flex-1 min-w-0">
                       <CategorySelect
                         value={action.value}
                         onChange={(val) => updateAction(i, 'value', val)}
@@ -278,7 +278,7 @@ export function RuleDialog({
                     </div>
                   ) : action.op === 'set_payee' ? (
                     <select
-                      className={`${selectClass} w-0 flex-1 min-w-0`}
+                      className={`${selectClass} w-full sm:w-0 sm:flex-1 min-w-0`}
                       value={action.value}
                       onChange={(e) => updateAction(i, 'value', e.target.value)}
                       required
@@ -290,7 +290,7 @@ export function RuleDialog({
                     </select>
                   ) : (
                     <Input
-                      className="w-0 flex-1 min-w-0 h-8 text-sm"
+                      className="w-full sm:w-0 sm:flex-1 min-w-0 h-8 text-sm"
                       value={action.value}
                       onChange={(e) => updateAction(i, 'value', e.target.value)}
                       placeholder="Ex: #work #reimbursable"
