@@ -360,6 +360,8 @@ export interface Rule {
   actions: RuleAction[]
   priority: number
   is_active: boolean
+  apply_to_existing?: boolean
+  overwrite_existing_categories?: boolean
 }
 
 export interface RuleExportItem {
@@ -451,7 +453,6 @@ export interface ProjectedTransaction {
   category_name: string | null
   category_icon: string | null
   category_color: string | null
-  is_ignored: boolean
 }
 
 export interface DashboardSummary {
