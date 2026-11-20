@@ -1,109 +1,129 @@
-import io
-import json
-import zipfile
-from datetime import date, datetime
-from decimal import Decimal
-from uuid import UUID
+from datetime import date
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.app_clock import app_today
 from app.core.database import get_async_session
 from app.core.workspace_context import WorkspaceContext, current_workspace
-from app.models.account import Account
-from app.models.asset import Asset
-from app.models.asset_value import AssetValue
-from app.models.budget import Budget
-from app.models.category import Category
-from app.models.category_group import CategoryGroup
-from app.models.import_log import ImportLog
-from app.models.recurring_transaction import RecurringTransaction
-from app.models.rule import Rule
-from app.models.transaction import Transaction
+from app.schemas.backup import BackupContent
+from app.schemas.export import BackupRequest
+from app.services import backup_service
+from app.services.accountant_export_service import build_accountant_export, zip_filename
 
 router = APIRouter(prefix="/api/export", tags=["export"])
 
+# Same cap as the custom report range: ten calendar years covers every
+# realistic accounting period without letting one request read the whole
+# history of a workspace.
+_MAX_ACCOUNTANT_RANGE_YEARS = 10
 
-def _serialize(obj) -> dict:
-    """Convert a SQLAlchemy model instance to a JSON-serializable dict."""
-    d = {}
-    for col in obj.__table__.columns:
-        val = getattr(obj, col.key)
-        if isinstance(val, UUID):
-            val = str(val)
-        elif isinstance(val, (datetime, date)):
-            val = val.isoformat()
-        elif isinstance(val, Decimal):
-            val = str(val)
-        d[col.key] = val
-    return d
+
+def _add_years(value: date, years: int) -> date:
+    """Add whole calendar years, clamping Feb 29 to Feb 28 when needed."""
+    try:
+        return value.replace(year=value.year + years)
+    except ValueError:
+        return date(value.year + years, 2, 28)
+
+
+def _resolve_accountant_range(start_date: date, end_date: date) -> tuple[date, date]:
+    """Validate the accountant export range.
+
+    The range must be non-empty, it must end no later than today on the
+    workspace calendar and it must stay within
+    :data:`_MAX_ACCOUNTANT_RANGE_YEARS` calendar years. A missing date is
+    refused by FastAPI itself, because both are required query parameters.
+    """
+    if end_date < start_date:
+        raise HTTPException(
+            status_code=422,
+            detail="end_date must be on or after start_date",
+        )
+    if end_date > app_today():
+        raise HTTPException(
+            status_code=422,
+            detail="end_date must be on or before today",
+        )
+    if end_date > _add_years(start_date, _MAX_ACCOUNTANT_RANGE_YEARS):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Custom range is too wide (max {_MAX_ACCOUNTANT_RANGE_YEARS} years)",
+        )
+    return start_date, end_date
+
+
+def _as_download(archive: bytes) -> StreamingResponse:
+    today = app_today().isoformat()
+    return StreamingResponse(
+        iter([archive]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="securo-backup-{today}.zip"'},
+    )
+
+
+@router.get("/accountant")
+async def accountant_export(
+    start_date: date = Query(..., description="First day of the period"),
+    end_date: date = Query(..., description="Last day of the period"),
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Export the period as two CSV files for an accountant.
+
+    Read-only, so a viewer may export. Only business workspaces have books an
+    accountant reconciles, so other kinds are refused. Every query in the
+    service is filtered by the current workspace id.
+    """
+    if ctx.workspace.kind != "business":
+        raise HTTPException(
+            status_code=403,
+            detail="Accountant export is only available for business workspaces",
+        )
+
+    start, end = _resolve_accountant_range(start_date, end_date)
+    archive = await build_accountant_export(session, ctx, start, end)
+    filename = zip_filename(ctx.workspace.name, start, end)
+    return StreamingResponse(
+        iter([archive]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/backup")
 async def backup(
+    content: BackupContent = Query(BackupContent.both),
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """Export every entity in the current workspace as a JSON zip.
-
-    Backup is scoped to one workspace at a time — users with multiple
-    workspaces back each one up separately. AssetValue inherits its
-    workspace from its Asset and is filtered transitively.
-    """
-    ws_id = ctx.workspace.id
-
-    accounts = (await session.execute(select(Account).where(Account.workspace_id == ws_id))).scalars().all()
-    transactions = (await session.execute(select(Transaction).where(Transaction.workspace_id == ws_id))).scalars().all()
-    categories = (await session.execute(select(Category).where(Category.workspace_id == ws_id))).scalars().all()
-    category_groups = (await session.execute(select(CategoryGroup).where(CategoryGroup.workspace_id == ws_id))).scalars().all()
-    rules = (await session.execute(select(Rule).where(Rule.workspace_id == ws_id))).scalars().all()
-    recurring_transactions = (await session.execute(select(RecurringTransaction).where(RecurringTransaction.workspace_id == ws_id))).scalars().all()
-    budgets = (await session.execute(select(Budget).where(Budget.workspace_id == ws_id))).scalars().all()
-    assets = (await session.execute(select(Asset).where(Asset.workspace_id == ws_id))).scalars().all()
-    import_logs = (await session.execute(select(ImportLog).where(ImportLog.workspace_id == ws_id))).scalars().all()
-
-    asset_ids = [a.id for a in assets]
-    if asset_ids:
-        asset_values = (await session.execute(select(AssetValue).where(AssetValue.asset_id.in_(asset_ids)))).scalars().all()
-    else:
-        asset_values = []
-
-    entities = {
-        "accounts": accounts,
-        "transactions": transactions,
-        "categories": categories,
-        "category_groups": category_groups,
-        "rules": rules,
-        "recurring_transactions": recurring_transactions,
-        "budgets": budgets,
-        "assets": assets,
-        "asset_values": asset_values,
-        "import_logs": import_logs,
-    }
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        entity_counts = {}
-        for name, rows in entities.items():
-            serialized = [_serialize(r) for r in rows]
-            entity_counts[name] = len(serialized)
-            zf.writestr(f"{name}.json", json.dumps(serialized, indent=2, ensure_ascii=False))
-
-        metadata = {
-            "export_date": datetime.utcnow().isoformat(),
-            "format_version": "1.0",
-            "workspace_id": str(ws_id),
-            "workspace_name": ctx.workspace.name,
-            "entity_counts": entity_counts,
-        }
-        zf.writestr("metadata.json", json.dumps(metadata, indent=2, ensure_ascii=False))
-
-    buf.seek(0)
-    today = date.today().isoformat()
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="securo-backup-{today}.zip"'},
+    """Export the selected workspace content as a restorable JSON ZIP."""
+    archive = await backup_service.build_backup_zip(
+        session,
+        ctx.workspace,
+        content=content,
     )
+    return _as_download(archive)
+
+
+@router.post("/backup")
+async def backup_protected(
+    body: BackupRequest,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """The same archive, encrypted with AES-256 when a password is given.
+
+    A POST because the password belongs in a body: a query string is written
+    to browser history, proxy logs and server access logs. Securo never stores
+    the password and cannot recover the archive without it.
+    """
+    password = body.password.get_secret_value() if body.password else None
+    archive = await backup_service.build_backup_zip(
+        session,
+        ctx.workspace,
+        content=BackupContent.both,
+        password=password,
+    )
+    return _as_download(archive)

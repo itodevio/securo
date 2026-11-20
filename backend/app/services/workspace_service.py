@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.models.user import User
 from app.models.workspace import (
@@ -36,8 +37,14 @@ async def create_personal_workspace_for_user(
 ) -> Workspace:
     """Create the user's auto-default Personal workspace + owner membership.
 
-    Idempotent: if the user already owns a personal workspace (e.g. the
-    migration ran), returns the existing one.
+    Idempotent: if the user already has a workspace they created and
+    belong to (e.g. the migration ran), returns the oldest one.
+
+    The guard matches on identity, not on `kind`: the bootstrap
+    workspace is the first one the user created and belongs to. Keying
+    off `kind == "personal"` would also match a second personal
+    workspace they made by hand, and which of the two came back would
+    depend on row order.
 
     Caller is responsible for committing unless `commit=True`. Defaults
     to flush-only because callers often want to bundle this with the
@@ -48,9 +55,9 @@ async def create_personal_workspace_for_user(
         .join(WorkspaceMember, WorkspaceMember.workspace_id == Workspace.id)
         .where(
             WorkspaceMember.user_id == user.id,
-            Workspace.kind == "personal",
             Workspace.created_by_user_id == user.id,
         )
+        .order_by(Workspace.created_at.asc())
         .limit(1)
     )
     found = existing.scalar_one_or_none()
@@ -209,6 +216,7 @@ async def create_workspace(
     kind: str = "personal",
     default_currency: Optional[str] = None,
     locale: Optional[str] = None,
+    tax_jurisdiction: Optional[str] = None,
     icon: Optional[str] = None,
     color: Optional[str] = None,
     self_membership: bool = False,
@@ -235,6 +243,7 @@ async def create_workspace(
         managed_by_user_id=creator.id,
         default_currency=default_currency or prefs.get("currency_display", "USD"),
         locale=workspace_locale,
+        tax_jurisdiction=tax_jurisdiction,
         icon=icon,
         color=color,
     )
@@ -286,6 +295,27 @@ async def list_members(session: AsyncSession, workspace_id: uuid.UUID) -> list[t
     user_rows = await session.execute(select(User).where(User.id.in_(user_ids)))
     users_by_id = {u.id: u for u in user_rows.scalars().all()}
     return [(m, users_by_id[m.user_id]) for m in members if m.user_id in users_by_id]
+
+
+async def list_directory_users(session: AsyncSession, user_id: uuid.UUID) -> list[User]:
+    """The user and everyone who shares a workspace with them, by email.
+
+    This is all the member directory may show (#1173): anyone else is found
+    only by their exact address. Two queries, for the same GUID/UUID reason
+    as ``list_members``.
+    """
+    callers = aliased(WorkspaceMember)
+    callers_workspaces = select(callers.workspace_id).where(callers.user_id == user_id)
+    co_members = await session.execute(
+        select(WorkspaceMember.user_id).where(
+            WorkspaceMember.workspace_id.in_(callers_workspaces)
+        )
+    )
+    user_ids = set(co_members.scalars().all()) | {user_id}
+    result = await session.execute(
+        select(User).where(User.id.in_(user_ids)).order_by(User.email)
+    )
+    return list(result.scalars().all())
 
 
 async def add_member(

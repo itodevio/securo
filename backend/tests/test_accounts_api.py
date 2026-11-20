@@ -1,7 +1,10 @@
+from decimal import Decimal
+
 import pytest
 from httpx import AsyncClient
 
 from app.models.account import Account
+from app.models.account_card import AccountCard
 
 
 @pytest.mark.asyncio
@@ -15,6 +18,86 @@ async def test_list_accounts(
     assert data[0]["name"] == "Conta Corrente"
     assert data[0]["type"] == "checking"
     assert data[0]["currency"] == "BRL"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "currency,balance,rate,primary_balance",
+    [
+        ("BRL", "1000.00", None, None),
+        ("USD", "1000.00", "5", 5000.0),
+        ("USD", "0.00", "5", 0.0),
+        ("EUR", "1000.00", None, None),
+    ],
+)
+async def test_list_accounts_exposes_reserved_balances(
+    client: AsyncClient, auth_headers, session, test_user, test_workspace,
+    currency, balance, rate, primary_balance,
+):
+    """The account payload carries the provider's pockets and their
+    same-currency total; `current_balance` stays the provider's figure exactly
+    as reported (ADR 0022)."""
+    import uuid
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from app.models.account_reserved_balance import AccountReservedBalance
+    from app.models.bank_connection import BankConnection
+    from app.core.app_clock import app_today
+    from app.models.fx_rate import FxRate
+
+    if rate is not None:
+        session.add(FxRate(
+            base_currency="USD", quote_currency="BRL", date=app_today(),
+            rate=Decimal(rate), source="test",
+        ))
+
+    conn = BankConnection(
+        id=uuid.uuid4(), user_id=test_user.id, provider="pluggy",
+        external_id="ext-reserved-api", institution_name="Mercado Pago",
+        credentials={}, status="active",
+        last_sync_at=datetime.now(timezone.utc), created_at=datetime.now(timezone.utc),
+    )
+    session.add(conn)
+    await session.flush()
+    account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        connection_id=conn.id, name="Mercado Pago", type="checking",
+        balance=Decimal(balance), currency=currency,
+    )
+    session.add(account)
+    await session.flush()
+    session.add_all([
+        AccountReservedBalance(
+            id=uuid.uuid4(), workspace_id=test_workspace.id, account_id=account.id,
+            external_id="emergency-fund", name="Emergency fund", currency=currency, amount=Decimal("0"),
+        ),
+        AccountReservedBalance(
+            id=uuid.uuid4(), workspace_id=test_workspace.id, account_id=account.id,
+            external_id="round-up", name="Round-up savings", currency=currency,
+            amount=Decimal("2000"),
+        ),
+        AccountReservedBalance(
+            id=uuid.uuid4(), workspace_id=test_workspace.id, account_id=account.id,
+            external_id="marketplace", name="Marketplace savings", currency=currency,
+            amount=Decimal("2000"),
+        ),
+    ])
+    await session.commit()
+
+    response = await client.get("/api/accounts", headers=auth_headers)
+    assert response.status_code == 200
+    payload = next(a for a in response.json() if a["id"] == str(account.id))
+
+    assert payload["reserved_total"] == 4000.0
+    assert payload["balance_primary"] == primary_balance
+    assert {r["external_id"]: r["name"] for r in payload["reserved_balances"]} == {
+        "emergency-fund": "Emergency fund",
+        "round-up": "Round-up savings",
+        "marketplace": "Marketplace savings",
+    }
+    # Reserve rows affect neither the provider balance nor its FX conversion.
+    assert payload["current_balance"] == float(balance)
 
 
 @pytest.mark.asyncio
@@ -45,6 +128,76 @@ async def test_get_account_not_found(client: AsyncClient, auth_headers, test_acc
         headers=auth_headers,
     )
     assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_linked_cards_can_be_labeled(
+    client: AsyncClient, auth_headers, session, test_user, test_workspace
+):
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Cartão principal",
+        type="credit_card",
+        balance=Decimal("0.00"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    linked_card = AccountCard(
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        masked_number="5062",
+    )
+    session.add(linked_card)
+    await session.commit()
+
+    listed = await client.get(f"/api/accounts/{account.id}/linked-cards", headers=auth_headers)
+    assert listed.status_code == 200
+    assert listed.json() == [
+        {
+            "id": str(linked_card.id),
+            "account_id": str(account.id),
+            "masked_number": "5062",
+            "label": None,
+        }
+    ]
+
+    updated = await client.patch(
+        f"/api/accounts/{account.id}/linked-cards",
+        headers=auth_headers,
+        json={"cards": [{"id": str(linked_card.id), "label": "  Cartão pessoal  "}]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()[0]["label"] == "Cartão pessoal"
+
+    workspace_cards = await client.get("/api/accounts/linked-cards", headers=auth_headers)
+    assert workspace_cards.status_code == 200
+    assert workspace_cards.json()[0]["id"] == str(linked_card.id)
+
+    # An item without a label is rejected instead of erasing the alias.
+    missing_label = await client.patch(
+        f"/api/accounts/{account.id}/linked-cards",
+        headers=auth_headers,
+        json={"cards": [{"id": str(linked_card.id)}]},
+    )
+    assert missing_label.status_code == 422
+
+    # A NUL character is a validation error, not a database error.
+    nul_label = await client.patch(
+        f"/api/accounts/{account.id}/linked-cards",
+        headers=auth_headers,
+        json={"cards": [{"id": str(linked_card.id), "label": "a\u0000b"}]},
+    )
+    assert nul_label.status_code == 422
+
+    cleared = await client.patch(
+        f"/api/accounts/{account.id}/linked-cards",
+        headers=auth_headers,
+        json={"cards": [{"id": str(linked_card.id), "label": ""}]},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()[0]["label"] is None
 
 
 @pytest.mark.asyncio
@@ -100,6 +253,33 @@ async def test_update_bank_connected_account_rejected(
     )
     assert response.status_code == 400
     assert "bank-connected" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_update_response_resolves_institution_like_get(
+    client: AsyncClient, auth_headers, session, test_account: Account, test_connection
+):
+    """PATCH must serialize with the connection the way GET does: on a
+    single-institution link a connection rename outranks the institution
+    row's name (review round 5 on #654)."""
+    from app.models.institution import Institution
+
+    inst = Institution(
+        connection_id=test_connection.id, external_id="org-1", name="First Bank",
+    )
+    session.add(inst)
+    await session.flush()
+    test_account.institution_id = inst.id
+    test_connection.display_name = "My Bank"
+    await session.commit()
+
+    response = await client.patch(
+        f"/api/accounts/{test_account.id}",
+        headers=auth_headers,
+        json={"display_name": "Everyday Checking"},
+    )
+    assert response.status_code == 200
+    assert response.json()["institution_name"] == "My Bank"
 
 
 @pytest.mark.asyncio
@@ -720,3 +900,218 @@ async def test_get_account_bills_rejects_invalid_limit(
         f"/api/accounts/{cc.id}/bills", headers=auth_headers, params={"limit": 0},
     )
     assert resp.status_code == 422  # Query(ge=1) bound
+
+
+@pytest.mark.asyncio
+async def test_get_account_reports_same_balance_as_list(
+    client: AsyncClient, auth_headers, session, test_user, test_workspace
+):
+    """A manual credit card's detail read must agree with the list (issue #535).
+
+    The detail endpoint used to serialize with no balance, so available_credit
+    fell back to the full limit while the list showed the real figure for the
+    same card at the same moment.
+    """
+    import uuid as _uuid
+    from datetime import date
+    from decimal import Decimal
+
+    from app.models.account import Account
+    from app.models.transaction import Transaction
+
+    card = Account(
+        id=_uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Card",
+        type="credit_card",
+        balance=Decimal("0.00"),
+        credit_limit=Decimal("1000.00"),
+        currency="BRL",
+    )
+    session.add(card)
+    await session.commit()
+
+    session.add(
+        Transaction(
+            id=_uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=card.id,
+            description="Spend",
+            amount=Decimal("400.00"),
+            type="debit",
+            date=date.today(),
+            status="posted",
+            source="manual",
+            currency="BRL",
+        )
+    )
+    await session.commit()
+
+    listed = next(
+        a for a in (await client.get("/api/accounts", headers=auth_headers)).json()
+        if a["id"] == str(card.id)
+    )
+    detail = (await client.get(f"/api/accounts/{card.id}", headers=auth_headers)).json()
+
+    assert detail["current_balance"] == listed["current_balance"] == -400.0
+    assert detail["available_credit"] == listed["available_credit"] == 600.0
+
+
+@pytest.mark.asyncio
+async def test_available_credit_holds_future_dated_charges(
+    client: AsyncClient, auth_headers, session, test_user, test_workspace
+):
+    """Future installments are not owed yet, but the card's limit is already
+    held for them, so available credit subtracts them (issue #1185)."""
+    import uuid as _uuid
+    from datetime import date, timedelta
+    from decimal import Decimal
+
+    from app.models.account import Account
+    from app.models.transaction import Transaction
+
+    card = Account(
+        id=_uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Installments Card",
+        type="credit_card",
+        balance=Decimal("0.00"),
+        credit_limit=Decimal("11001.00"),
+        currency="BRL",
+    )
+    session.add(card)
+    await session.commit()
+
+    today = date.today()
+    for description, amount, txn_type, when in [
+        ("Apple iCloud", "19.90", "debit", today),
+        ("MOBILLS 2/12", "19.90", "debit", today + timedelta(days=20)),
+        ("Mercado Livre 3/10", "479.45", "debit", today + timedelta(days=23)),
+        # A future-dated refund does not free the limit before it happens.
+        ("Refund", "50.00", "credit", today + timedelta(days=5)),
+    ]:
+        session.add(
+            Transaction(
+                id=_uuid.uuid4(),
+                user_id=test_user.id,
+                workspace_id=test_workspace.id,
+                account_id=card.id,
+                description=description,
+                amount=Decimal(amount),
+                type=txn_type,
+                date=when,
+                status="posted",
+                source="manual",
+                currency="BRL",
+            )
+        )
+    await session.commit()
+
+    listed = next(
+        a for a in (await client.get("/api/accounts", headers=auth_headers)).json()
+        if a["id"] == str(card.id)
+    )
+    detail = (await client.get(f"/api/accounts/{card.id}", headers=auth_headers)).json()
+
+    # Owed today is unchanged; the limit is held for the two future installments.
+    assert detail["current_balance"] == listed["current_balance"] == pytest.approx(-19.90)
+    assert detail["available_credit"] == listed["available_credit"] == pytest.approx(10481.75)
+
+
+@pytest.mark.asyncio
+async def test_available_credit_of_connected_card_ignores_future_rows(
+    client: AsyncClient, auth_headers, session, test_user, test_workspace, test_connection
+):
+    """A connected card's provider balance is the truth; future-dated rows
+    synced onto it don't change its available credit."""
+    import uuid as _uuid
+    from datetime import date, timedelta
+    from decimal import Decimal
+
+    from app.models.account import Account
+    from app.models.transaction import Transaction
+
+    card = Account(
+        id=_uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        connection_id=test_connection.id,
+        name="Connected Card",
+        type="credit_card",
+        balance=Decimal("300.00"),
+        credit_limit=Decimal("1000.00"),
+        currency="BRL",
+    )
+    session.add(card)
+    await session.commit()
+    session.add(
+        Transaction(
+            id=_uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=card.id,
+            description="Future installment",
+            amount=Decimal("100.00"),
+            type="debit",
+            date=date.today() + timedelta(days=10),
+            status="posted",
+            source="sync",
+            currency="BRL",
+        )
+    )
+    await session.commit()
+
+    detail = (await client.get(f"/api/accounts/{card.id}", headers=auth_headers)).json()
+
+    assert detail["available_credit"] == pytest.approx(700.0)
+
+
+@pytest.mark.asyncio
+async def test_account_reports_its_opening_balance_date(client: AsyncClient, auth_headers):
+    """Issue #1204: the payload carries the opening balance's date, and an
+    edit that leaves `balance_date` out keeps it."""
+    created = await client.post(
+        "/api/accounts",
+        headers=auth_headers,
+        json={
+            "name": "Checking",
+            "type": "checking",
+            "balance": "1000.00",
+            "balance_date": "2026-08-01",
+            "currency": "USD",
+        },
+    )
+    assert created.status_code == 201
+    account_id = created.json()["id"]
+
+    listed = await client.get("/api/accounts", headers=auth_headers)
+    assert [a["balance_date"] for a in listed.json()] == ["2026-08-01"]
+
+    renamed = await client.patch(
+        f"/api/accounts/{account_id}",
+        headers=auth_headers,
+        json={"name": "Main checking", "balance": "1000.00", "currency": "USD"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["balance_date"] == "2026-08-01"
+
+    moved = await client.patch(
+        f"/api/accounts/{account_id}", headers=auth_headers, json={"balance_date": "2026-07-15"}
+    )
+    assert moved.json()["balance_date"] == "2026-07-15"
+
+
+@pytest.mark.asyncio
+async def test_account_without_opening_balance_has_no_balance_date(
+    client: AsyncClient, auth_headers
+):
+    created = await client.post(
+        "/api/accounts",
+        headers=auth_headers,
+        json={"name": "Empty", "type": "checking", "balance": "0", "currency": "USD"},
+    )
+    fetched = await client.get(f"/api/accounts/{created.json()['id']}", headers=auth_headers)
+    assert fetched.json()["balance_date"] is None

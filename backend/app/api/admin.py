@@ -1,11 +1,20 @@
 import uuid
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import UserManager, current_active_user, current_superuser, get_user_manager
+from app.core.auth_policy import require_local_auth_enabled
 from app.core.database import get_async_session
+from app.core.app_clock import (
+    app_timezone,
+    environment_timezone,
+    invalidate_timezone_cache,
+    is_valid_timezone,
+    saved_timezone_name,
+    timezone_names,
+)
 from app.models.user import User
 from app.schemas.admin import (
     AdminUserCreate,
@@ -14,8 +23,11 @@ from app.schemas.admin import (
     AdminUserUpdate,
     AppSettingRead,
     AppSettingUpdate,
+    ProviderSettingRead,
+    TimezoneSettingRead,
 )
 from app.services import admin_service
+from app.services import provider_settings
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -27,6 +39,7 @@ ALLOWED_SETTINGS = {
     "theme_color_dark",
     "number_format",
     "date_format",
+    "timezone",
 }
 
 
@@ -45,7 +58,12 @@ async def list_users(
     )
 
 
-@router.post("/users", response_model=AdminUserRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/users",
+    response_model=AdminUserRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_local_auth_enabled)],
+)
 async def create_user(
     data: AdminUserCreate,
     session: AsyncSession = Depends(get_async_session),
@@ -78,6 +96,8 @@ async def update_user(
     session: AsyncSession = Depends(get_async_session),
     current_user: User = Depends(current_superuser),
 ):
+    if data.password is not None:
+        require_local_auth_enabled()
     try:
         user = await admin_service.update_user(session, user_id, data, current_user.id)
     except ValueError as e:
@@ -107,10 +127,40 @@ async def get_setting(
     session: AsyncSession = Depends(get_async_session),
     _user: User = Depends(current_superuser),
 ):
+    if key in provider_settings.SETTING_FIELDS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Setting not found")
     setting = await admin_service.get_app_setting(session, key)
     if not setting:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Setting not found")
     return AppSettingRead.model_validate(setting)
+
+
+@router.get("/provider-settings", response_model=list[ProviderSettingRead])
+async def get_provider_settings(
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    return await provider_settings.provider_status(session)
+
+
+@router.patch("/provider-settings/{provider}", response_model=ProviderSettingRead)
+async def update_provider_settings(
+    provider: str,
+    request: Request,
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    # Parse explicitly so schema validation errors cannot echo submitted secrets.
+    try:
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) != {"values"} or not isinstance(body["values"], dict):
+            raise ValueError("Invalid provider settings")
+        return await provider_settings.update_provider(session, provider, body["values"])
+    except provider_settings.SecretStorageUnavailable as exc:
+        # Fixed server-side text, never the submitted values.
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid provider settings") from None
 
 
 @router.patch("/settings/{key}", response_model=AppSettingRead)
@@ -125,6 +175,8 @@ async def update_setting(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Setting '{key}' is not configurable",
         )
+    if key == "timezone" and not is_valid_timezone(data.value):
+        raise HTTPException(status_code=400, detail="Invalid IANA timezone")
     SETTING_VALIDATORS = {
         "registration_enabled": {"true", "false"},
         "credit_card_accounting_mode": {"cash", "accrual"},
@@ -147,7 +199,40 @@ async def update_setting(
             )
 
     setting = await admin_service.set_app_setting(session, key, data.value)
+    if key == "timezone":
+        invalidate_timezone_cache()
     return AppSettingRead.model_validate(setting)
+
+
+@router.delete("/settings/{key}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_setting(
+    key: str,
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    """Forget a saved setting so the application falls back to its default."""
+    if key not in ALLOWED_SETTINGS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Setting '{key}' is not configurable",
+        )
+    await admin_service.delete_app_setting(session, key)
+    if key == "timezone":
+        invalidate_timezone_cache()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/timezone", response_model=TimezoneSettingRead)
+async def timezone_setting(
+    session: AsyncSession = Depends(get_async_session),
+    _user: User = Depends(current_superuser),
+):
+    return TimezoneSettingRead(
+        timezone=str(app_timezone()),
+        saved=await saved_timezone_name(session),
+        fallback=str(environment_timezone()),
+        available=sorted(timezone_names()),
+    )
 
 
 @router.get("/registration-status")

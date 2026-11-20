@@ -51,6 +51,31 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # Opaque Gemini signature; replay unchanged, never pass to the tool itself.
+    thought_signature: Optional[str] = None
+    # The raw argument text when it was not a JSON object. `arguments` is then
+    # empty and the tool must not run: the model gets an error back instead.
+    invalid_arguments: Optional[str] = None
+
+
+def parse_tool_arguments(buf: str) -> tuple[dict[str, Any], Optional[str]]:
+    """Parse a streamed argument buffer into (arguments, invalid_raw_text).
+
+    An empty buffer is a call with no arguments. Anything that is not one
+    JSON object (bad JSON, two objects glued together, a list) comes back
+    as ({}, buf) so the caller can refuse the call rather than run the tool
+    with made-up arguments.
+    """
+    if not buf:
+        return {}, None
+    import json
+    try:
+        parsed = json.loads(buf)
+    except json.JSONDecodeError:
+        return {}, buf
+    if not isinstance(parsed, dict):
+        return {}, buf
+    return parsed, None
 
 
 @dataclass
@@ -87,6 +112,8 @@ class ChatChunk:
     args_delta: Optional[str] = None  # incremental JSON args while streaming
     finish_reason: Optional[str] = None
     usage: Optional[Usage] = None
+    # Delivered on tool_call_end, after all streaming deltas have arrived.
+    thought_signature: Optional[str] = None
 
 
 @dataclass
@@ -107,11 +134,14 @@ class LLMProvider(ABC):
 
     def __init__(self, *, api_key: str = "", base_url: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key
-        self.base_url = base_url
+        self.base_url: str = base_url or ""
         self.default_model = model
+        # Stable per-conversation id, set by the executor before each run.
+        # Providers whose backends route on it send it as a request header.
+        self.session_id: Optional[str] = None
 
     @abstractmethod
-    async def chat_stream(
+    def chat_stream(
         self,
         messages: list[ChatMessage],
         *,
@@ -147,18 +177,20 @@ class LLMProvider(ABC):
             elif chunk.type == "tool_call_args_delta" and chunk.tool_call_id:
                 tc = tool_calls.setdefault(chunk.tool_call_id, {"id": chunk.tool_call_id, "name": chunk.tool_name or "", "args_buf": ""})
                 tc["args_buf"] += chunk.args_delta or ""
+            elif chunk.type == "tool_call_end" and chunk.tool_call_id in tool_calls:
+                tool_calls[chunk.tool_call_id]["thought_signature"] = chunk.thought_signature
             elif chunk.type == "finish" and chunk.finish_reason:
                 finish = chunk.finish_reason
             elif chunk.type == "usage" and chunk.usage:
                 usage = chunk.usage
-        import json
         parsed_calls = []
         for tc in tool_calls.values():
-            try:
-                args = json.loads(tc["args_buf"]) if tc["args_buf"] else {}
-            except json.JSONDecodeError:
-                args = {"_raw": tc["args_buf"]}
-            parsed_calls.append(ToolCall(id=tc["id"], name=tc["name"], arguments=args))
+            args, invalid = parse_tool_arguments(tc["args_buf"])
+            parsed_calls.append(ToolCall(
+                id=tc["id"], name=tc["name"], arguments=args,
+                thought_signature=tc.get("thought_signature"),
+                invalid_arguments=invalid,
+            ))
         return ChatResponse(content="".join(text_parts), tool_calls=parsed_calls, finish_reason=finish, usage=usage)
 
     @abstractmethod

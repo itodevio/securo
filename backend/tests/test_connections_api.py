@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.bank_connection import BankConnection
 from app.models.user import User
-from app.providers.base import ProviderUserActionRequired, SessionExpiredError
+from app.providers.base import (
+    ProviderRateLimited,
+    ProviderUserActionRequired,
+    SessionExpiredError,
+)
 
 
 @pytest.mark.asyncio
@@ -68,13 +72,55 @@ async def test_delete_connection(
     client: AsyncClient, auth_headers, test_connection: BankConnection
 ):
     response = await client.delete(
-        f"/api/connections/{test_connection.id}", headers=auth_headers
+        f"/api/connections/{test_connection.id}",
+        params={"keep_accounts": "false"},
+        headers=auth_headers,
     )
     assert response.status_code == 204
 
     # Verify it's gone
     response = await client.get("/api/connections", headers=auth_headers)
     assert response.json() == []
+
+
+@pytest.mark.asyncio
+async def test_disconnect_keeps_accounts_and_history_by_default(
+    client: AsyncClient, auth_headers, test_connection: BankConnection, test_transactions
+):
+    """Disconnecting without saying otherwise keeps the accounts and their
+    transactions and archives the connection (#1018)."""
+    accounts_before = (await client.get("/api/accounts", headers=auth_headers)).json()
+    txs_before = (await client.get("/api/transactions", headers=auth_headers)).json()
+
+    response = await client.delete(
+        f"/api/connections/{test_connection.id}", headers=auth_headers
+    )
+    assert response.status_code == 204
+
+    connections = (await client.get("/api/connections", headers=auth_headers)).json()
+    assert [(c["id"], c["status"]) for c in connections] == [
+        (str(test_connection.id), "disconnected")
+    ]
+    accounts_after = (await client.get("/api/accounts", headers=auth_headers)).json()
+    assert [a["id"] for a in accounts_after] == [a["id"] for a in accounts_before]
+    txs_after = (await client.get("/api/transactions", headers=auth_headers)).json()
+    assert txs_after["total"] == txs_before["total"] > 0
+
+
+@pytest.mark.asyncio
+async def test_sync_of_disconnected_connection_is_refused(
+    client: AsyncClient, auth_headers, test_connection: BankConnection
+):
+    await client.delete(f"/api/connections/{test_connection.id}", headers=auth_headers)
+
+    with patch("app.services.connection_service.get_provider") as mock_gp:
+        response = await client.post(
+            f"/api/connections/{test_connection.id}/sync", headers=auth_headers
+        )
+
+    assert response.status_code == 409
+    assert "disconnected" in response.json()["detail"]
+    mock_gp.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -278,6 +324,57 @@ async def test_sync_connection_session_expired_returns_gone(
 
 
 @pytest.mark.asyncio
+async def test_sync_connection_success_reports_refreshed_outcome(
+    client: AsyncClient, auth_headers, test_connection: BankConnection
+):
+    """A completed sync reports sync_outcome='refreshed' (issue #736)."""
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(return_value=[])
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
+         patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
+         patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
+         patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/sync", headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sync_outcome"] == "refreshed"
+    assert body["merged_count"] == 0
+    assert body["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_reports_outcome(
+    client: AsyncClient, auth_headers, test_connection: BankConnection
+):
+    """A provider 429 returns 200 with sync_outcome='rate_limited' so the UI
+    does not show a success toast (issue #736)."""
+    stale_sync_at = test_connection.last_sync_at
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(
+        side_effect=ProviderRateLimited("Daily request limit reached")
+    )
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/sync", headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sync_outcome"] == "rate_limited"
+    assert body["merged_count"] == 0
+    assert body["status"] == "active"
+    # No fresh data was pulled, so the last sync timestamp is untouched.
+    assert datetime.fromisoformat(
+        body["last_sync_at"].replace("Z", "+00:00")
+    ) == stale_sync_at
+
+
+@pytest.mark.asyncio
 async def test_reconnect_token_not_found(client: AsyncClient, auth_headers):
     resp = await client.post(
         f"/api/connections/{uuid.uuid4()}/reconnect-token", headers=auth_headers,
@@ -328,6 +425,28 @@ async def test_reconnect_token_with_item_id(
         )
         assert resp.status_code == 200
         assert resp.json()["access_token"] == "recon-token"
+
+
+@pytest.mark.asyncio
+async def test_reconnect_token_after_disconnect_reopens_the_same_item(
+    client: AsyncClient, auth_headers, test_connection: BankConnection,
+):
+    """Disconnecting drops the credentials, so the reconnect token has to find
+    the widget item through the connection's external_id."""
+    await client.delete(f"/api/connections/{test_connection.id}", headers=auth_headers)
+
+    mock_token = MagicMock()
+    mock_token.access_token = "recon-token"
+    with patch("app.services.connection_service.get_provider") as mock_gp:
+        mock_gp.return_value.create_connect_token = AsyncMock(return_value=mock_token)
+        resp = await client.post(
+            f"/api/connections/{test_connection.id}/reconnect-token", headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    mock_gp.return_value.create_connect_token.assert_awaited_once_with(
+        str(test_connection.user_id), item_id="ext-123"
+    )
 
 
 @pytest.mark.asyncio

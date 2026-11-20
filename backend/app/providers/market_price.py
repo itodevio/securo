@@ -28,13 +28,24 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from datetime import date, datetime
 from decimal import Decimal
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from app.providers.favicon import favicon_url_for
 from app.schemas.asset import MarketSymbolMatch, MarketSymbolQuote
 
 logger = logging.getLogger(__name__)
+
+
+class LatestClose(NamedTuple):
+    """A symbol's latest price and the trading day it closed on.
+
+    ``on`` is None when the provider can't say which day the price is from.
+    """
+
+    price: Decimal
+    on: Optional[date]
 
 
 # Yahoo Finance occasionally reports prices in minor units (pence, cents).
@@ -107,6 +118,15 @@ class MarketPriceProvider(ABC):
                 out[key] = Decimal(str(quote.price))
         return out
 
+    async def get_latest_closes(self, symbols: list[str]) -> dict[str, Optional[LatestClose]]:
+        """`get_latest_prices` with the trading day each price closed on.
+
+        The scheduled refresh uses the day to tell a close from before a
+        recorded split. The default doesn't know the day.
+        """
+        prices = await self.get_latest_prices(symbols)
+        return {s: LatestClose(p, None) if p is not None else None for s, p in prices.items()}
+
 
 class YFinanceProvider(MarketPriceProvider):
     """Yahoo Finance provider backed by the ``yfinance`` Python library.
@@ -172,30 +192,66 @@ class YFinanceProvider(MarketPriceProvider):
         creation time; we just update the price and let ``current_value``
         recompute from ``units × last_price``.
 
-        Note on minor-unit currencies (GBp, ZAc on LSE/JSE): those are
-        normalized to GBP/ZAR ×0.01 at creation (via ``get_quote``), but
-        on refresh we only get the raw trading-currency close. The batch
-        preserves the same unit as the upstream quote, so internal
-        consistency is maintained as long as the asset's stored currency
-        matches the ticker's reporting unit. If Yahoo changes a listing's
-        reporting unit mid-stream the price will appear off by 100× — rare
-        enough to address reactively rather than pre-emptively.
+        Note on minor-unit currencies (GBp, ZAc on LSE/JSE): ``download``
+        returns the raw pence/cents close, so ``*.L`` / ``*.JO`` tickers get
+        a follow-up ``fast_info.currency`` lookup and are scaled ×0.01 to
+        match the GBP/ZAR normalization ``get_quote`` applies at creation.
+        If that lookup fails for a ticker its price is returned as ``None``
+        rather than raw, so the caller falls back to ``get_quote``.
         """
+        closes = await self.get_latest_closes(symbols)
+        return {s: c.price if c is not None else None for s, c in closes.items()}
+
+    async def get_latest_closes(self, symbols: list[str]) -> dict[str, Optional[LatestClose]]:
+        """The batch download behind `get_latest_prices`, keeping each close's day."""
         if not symbols:
             return {}
         unique = list(dict.fromkeys(s.strip().upper() for s in symbols if s and s.strip()))
         if not unique:
             return {}
 
-        out: dict[str, Optional[Decimal]] = {s: None for s in unique}
+        out: dict[str, Optional[LatestClose]] = {s: None for s in unique}
         for i in range(0, len(unique), self._BATCH_CHUNK_SIZE):
             chunk = unique[i : i + self._BATCH_CHUNK_SIZE]
             try:
-                chunk_prices = await asyncio.to_thread(self._download_prices_sync, chunk)
+                chunk_prices = await asyncio.to_thread(self._download_closes_sync, chunk)
             except _rate_limit_exception_types():
                 raise MarketPriceRateLimitedError(
                     "Yahoo Finance rate-limited the batch price download"
                 )
+
+            # Normalize minor-unit prices (GBp → GBP, ZAc → ZAR, both ×0.01).
+            # yf.download returns raw pence/cents for LSE/JSE tickers without
+            # a currency tag; we fetch fast_info.currency only for the tickers
+            # that actually need it (*.L and *.JO suffixes) to keep the extra
+            # round-trips minimal.
+            candidates = [
+                s for s, p in chunk_prices.items()
+                if p is not None and (s.endswith(".L") or s.endswith(".JO"))
+            ]
+            if candidates:
+                try:
+                    currencies = await asyncio.to_thread(
+                        self._get_currencies_sync, candidates
+                    )
+                except Exception as e:  # pragma: no cover (upstream flakiness, not logic)
+                    logger.warning(
+                        "minor-unit currency check failed for %s: %s", candidates, e
+                    )
+                    currencies = {}
+                for sym in candidates:
+                    currency = currencies.get(sym)
+                    if not currency:
+                        # Unit unknown: a raw pence/cents close could be
+                        # 100× off, so drop it and let the caller fall back
+                        # to ``get_quote``, which normalizes on its own.
+                        chunk_prices[sym] = None
+                        continue
+                    conv = _MINOR_UNIT_CURRENCIES.get(currency)
+                    close = chunk_prices[sym]
+                    if conv is not None and close is not None:
+                        chunk_prices[sym] = close._replace(price=close.price * Decimal(str(conv[1])))
+
             out.update(chunk_prices)
         return out
 
@@ -249,22 +305,43 @@ class YFinanceProvider(MarketPriceProvider):
             return list(response.get("quotes") or [])
         except _rate_limit_exception_types():
             raise MarketPriceRateLimitedError("Yahoo Finance rate-limited the search")
-        except Exception as e:  # pragma: no cover — upstream flakiness, not logic
+        except Exception as e:  # pragma: no cover (upstream flakiness, not logic)
             logger.warning("yfinance search failed for %r: %s", query, e)
             return []
 
     @staticmethod
-    def _download_prices_sync(symbols: list[str]) -> dict[str, Optional[Decimal]]:
-        """Run ``yf.download`` and extract last-close per symbol.
+    def _get_currencies_sync(symbols: list[str]) -> dict[str, Optional[str]]:
+        """Return ``fast_info.currency`` for each symbol.
+
+        Used by ``get_latest_prices`` to identify minor-unit tickers (GBp,
+        ZAc) after a ``yf.download`` batch, which returns raw prices without
+        currency metadata. Only called for the small subset of tickers whose
+        exchange suffix suggests a minor-unit quote (``*.L``, ``*.JO``).
+        """
+        import yfinance as yf
+
+        out: dict[str, Optional[str]] = {}
+        for sym in symbols:
+            try:
+                currency = _fast_info_value(yf.Ticker(sym).fast_info, "currency")
+                out[sym] = str(currency) if currency is not None else None
+            except Exception:
+                out[sym] = None
+        return out
+
+    @staticmethod
+    def _download_closes_sync(symbols: list[str]) -> dict[str, Optional[LatestClose]]:
+        """Run ``yf.download`` and extract the last close per symbol, with its day.
 
         ``yf.download`` returns a pandas DataFrame: flat columns for a
         single symbol, MultiIndex (symbol, field) for multiple. Period is
         ``"5d"`` so we span weekends and market holidays while still
-        getting today's close once the market has ticked.
+        getting today's close once the market has ticked. Before the market
+        opens, the last row is the previous trading day.
         """
         import yfinance as yf
 
-        out: dict[str, Optional[Decimal]] = {s: None for s in symbols}
+        out: dict[str, Optional[LatestClose]] = {s: None for s in symbols}
         if not symbols:
             return out
 
@@ -283,7 +360,7 @@ class YFinanceProvider(MarketPriceProvider):
                 # Swallowing upstream failures silently would leave callers
                 # unable to distinguish "no data" from "request blew up".
             )
-        except Exception as e:  # pragma: no cover — upstream flakiness
+        except Exception as e:  # pragma: no cover (upstream flakiness)
             logger.warning("yfinance batch download failed for %d symbols: %s", len(symbols), e)
             return out
 
@@ -367,12 +444,13 @@ class YFinanceProvider(MarketPriceProvider):
 _logo_url_for = favicon_url_for
 
 
-def _last_decimal_close(series) -> Optional[Decimal]:
+def _last_decimal_close(series) -> Optional[LatestClose]:
     """Return the most recent non-NaN Close price from a pandas Series.
 
     Weekends and holidays are NaN; drop them and grab the tail. If the
     whole series is empty or all-NaN we return None so the caller can
-    skip the asset instead of writing garbage.
+    skip the asset instead of writing garbage. The row's index is the
+    trading day; a row without a readable date comes back with ``on=None``.
     """
     if series is None:
         return None
@@ -389,9 +467,20 @@ def _last_decimal_close(series) -> Optional[Decimal]:
     if pd.isna(val):
         return None
     try:
-        return Decimal(str(float(val)))
+        price = Decimal(str(float(val)))
     except (TypeError, ValueError):
         return None
+    return LatestClose(price, _trading_day(cleaned.index[-1]))
+
+
+def _trading_day(label) -> Optional[date]:
+    """The calendar day of a ``yf.download`` row label (a pandas Timestamp)."""
+    if isinstance(label, datetime):
+        # A Timestamp is a datetime; its .date() is the exchange-local day.
+        return label.date()
+    if isinstance(label, date):
+        return label
+    return None
 
 
 def _fast_info_value(fast_info, key: str):
@@ -478,6 +567,17 @@ class CompositeMarketPriceProvider(MarketPriceProvider):
             out.update(await self.default_provider.get_latest_prices(regular))
         if tesouro:
             out.update(await self._tesouro_latest_prices(tesouro))
+        return out
+
+    async def get_latest_closes(self, symbols: list[str]) -> dict[str, Optional[LatestClose]]:
+        tesouro = [s for s in symbols if _is_tesouro_symbol(s)]
+        regular = [s for s in symbols if not _is_tesouro_symbol(s)]
+        out: dict[str, Optional[LatestClose]] = {}
+        if regular:
+            out.update(await self.default_provider.get_latest_closes(regular))
+        if tesouro:
+            prices = await self._tesouro_latest_prices(tesouro)
+            out.update({s: LatestClose(p, None) if p is not None else None for s, p in prices.items()})
         return out
 
     async def _search_tesouro(self, query: str, limit: int) -> list[MarketSymbolMatch]:

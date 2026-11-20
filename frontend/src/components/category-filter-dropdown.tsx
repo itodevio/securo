@@ -56,11 +56,11 @@ export function CategoryFilterDropdown({
           type="button"
           className={
             triggerClassName ??
-            `inline-flex min-w-[10rem] h-8 items-center gap-1.5 justify-between rounded-md border border-border px-3 text-sm bg-background hover:bg-muted transition-colors focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]`
+            `inline-flex min-w-[10rem] h-8 items-center gap-1.5 justify-between rounded-md border border-border px-3 text-sm bg-card hover:bg-muted transition-colors focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]`
           }
         >
           <Tag size={13} className="text-muted-foreground" />
-          <span className={`flex-1 text-left ${hasFilter ? 'text-foreground' : 'text-muted-foreground'}`}>
+          <span className={`flex-1 text-start ${hasFilter ? 'text-foreground' : 'text-muted-foreground'}`}>
             {summary || displayLabel}
           </span>
           <ChevronDown size={12} className="text-muted-foreground" />

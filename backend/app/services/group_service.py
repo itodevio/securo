@@ -1,13 +1,16 @@
+import unicodedata
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.shared_scope import bound_workspace_id
 from app.models.group import Group, GroupMember
 from app.models.user import User
+from app.models.workspace import WorkspaceMember
 from app.schemas.group import (
     GroupCreate,
     GroupMemberCreate,
@@ -23,7 +26,7 @@ def _tag_owner(group: Group, user_id: uuid.UUID) -> Group:
     workspace it lives in — `Group.user_id` retains creator semantics
     even after the workspace migration.
     """
-    group.is_owner = group.user_id == user_id  # type: ignore[attr-defined]
+    group.is_owner = group.user_id == user_id
     if getattr(group, "members", None):
         for m in group.members:
             _tag_member_self(m, user_id, group.user_id)
@@ -75,23 +78,40 @@ async def _resolve_member_email(
 def _visible_predicate(workspace_id: uuid.UUID, user_id: uuid.UUID):
     """Group is visible when EITHER:
       - it lives in the current workspace (any workspace member sees it), OR
-      - the requesting user is linked as a member from outside the
-        workspace (cross-workspace settlement projection — the Splitwise
-        case where Adam invites Eve from her own workspace).
-
-    `is_self` memberships are EXCLUDED from the cross-workspace
-    projection: those represent the group's owner, who should see the
-    group only in the workspace where it lives — not in every other
-    workspace they belong to.
+      - the requesting user is a member from outside the workspace: linked
+        to it (a member added from their own workspace) or its owner in
+        their own self-member. The owner's shares are projected into every
+        workspace they belong to (#1305), so the row's group link must open
+        from there too, never from a workspace they are not a member of.
+        Editing still goes through `get_group`, which stays workspace-scoped.
     """
+    belongs_here = (
+        select(WorkspaceMember.id)
+        .where(
+            WorkspaceMember.workspace_id == workspace_id,
+            WorkspaceMember.user_id == user_id,
+        )
+        .exists()
+    )
+    # Mirrors `shared_scope.viewer_member_predicate`, with the owner's
+    # self-member narrowed to workspaces the user belongs to.
     member_groups = (
         select(GroupMember.group_id)
+        .outerjoin(Group, Group.id == GroupMember.group_id)
         .where(
-            GroupMember.linked_user_id == user_id,
-            GroupMember.is_self.is_(False),
+            or_(
+                GroupMember.linked_user_id == user_id,
+                and_(
+                    GroupMember.is_self.is_(True),
+                    Group.user_id == user_id,
+                    belongs_here,
+                ),
+            )
         )
         .distinct()
     )
+    if bound_workspace_id() is not None:
+        return Group.workspace_id == workspace_id
     return or_(Group.workspace_id == workspace_id, Group.id.in_(member_groups))
 
 
@@ -100,6 +120,8 @@ async def list_groups(
     workspace_id: uuid.UUID,
     user_id: uuid.UUID,
     include_archived: bool = False,
+    q: Optional[str] = None,
+    status: Optional[Literal['active', 'archived', 'all']] = None,
 ) -> list[Group]:
     query = (
         select(Group)
@@ -107,10 +129,22 @@ async def list_groups(
         .options(selectinload(Group.members))
         .order_by(Group.created_at.desc())
     )
-    if not include_archived:
+    if status == 'archived':
+        query = query.where(Group.is_archived.is_(True))
+    elif status == 'active' or (status is None and not include_archived):
         query = query.where(Group.is_archived.is_(False))
     result = await session.execute(query)
-    return [_tag_owner(g, user_id) for g in result.scalars().all()]
+    groups = result.scalars().all()
+    if q and q.strip():
+        def normalize(value: str) -> str:
+            return ''.join(
+                char for char in unicodedata.normalize('NFD', value.casefold())
+                if not unicodedata.combining(char)
+            )
+
+        search = normalize(q.strip())
+        groups = [group for group in groups if search in normalize(group.name)]
+    return [_tag_owner(g, user_id) for g in groups]
 
 
 async def get_group(
@@ -408,9 +442,14 @@ async def list_transactions(
     )
     txs = list(result.scalars().all())
     # Hydrate fields the TransactionRead schema expects.
+    from sqlalchemy.orm.attributes import set_committed_value
+
     for tx in txs:
         tx.attachment_count = 0
         tx.payee_name = tx.payee_entity.name if tx.payee_entity else None
+        # A linked member's row keeps its card ending in its own workspace.
+        if tx.workspace_id != workspace_id:
+            set_committed_value(tx, "card_masked_number", None)
     return txs
 
 

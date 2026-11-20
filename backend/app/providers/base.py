@@ -4,6 +4,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Literal, Optional
 
+from app.core.config import Settings
+
 
 # Outcome of asking a provider to pull fresh data from the underlying institution
 # before we read accounts/transactions.
@@ -16,6 +18,20 @@ from typing import Literal, Optional
 # - "failed":            transient error (timeout, rate limit). Caller may proceed
 #                        with a stale read; we don't punish the user for it.
 RefreshOutcome = Literal["refreshed", "skipped", "needs_user_action", "failed"]
+
+
+def default_oauth_redirect_uri() -> str:
+    """The OAuth callback URL implied by where the frontend is served.
+
+    Providers fall back to this when their own ``*_OAUTH_REDIRECT_URI`` is
+    unset, so a deployment on a custom port or domain works without setting one
+    variable per provider. Deriving it here rather than in Compose also keeps
+    the compose files free of nested ``${VAR:-${OTHER:-x}}`` interpolation,
+    which podman-compose cannot parse (containers/podman-compose#1064).
+    """
+    from app.core.config import get_settings
+
+    return f"{get_settings().frontend_url.rstrip('/')}/oauth/callback"
 
 
 def mask_last4(value: Optional[str]) -> Optional[str]:
@@ -40,7 +56,30 @@ def mask_last4(value: Optional[str]) -> Optional[str]:
 
 
 @dataclass
+class ReservedBalanceData:
+    """Funds an institution holds reserved/earmarked inside an account.
+
+    Mercado Pago cofrinhos, "saldo reservado", caixinhas. Providers report
+    these beside the account balance without guaranteeing whether they are
+    included, so they are stored and shown without changing totals (ADR 0022).
+    `external_id` is the provider's identification, stable across syncs and
+    scoped to its account. One instance per currency: `amount` sums the
+    reservation's remuneration bands in that currency.
+    """
+
+    external_id: str
+    name: Optional[str]
+    currency: str
+    amount: Decimal
+
+
+@dataclass
 class AccountData:
+    # The provider's identifier for this account. It is expected to be stable
+    # across re-syncs, and the sync matches an incoming account on it first. A
+    # provider that re-keys it (Enable Banking mints a `uid` scoped to a single
+    # session) must also set `stable_external_id`, or re-syncing inserts a
+    # duplicate instead of recognising the account it already imported.
     external_id: str
     name: str
     type: str  # checking, savings, credit_card
@@ -56,6 +95,41 @@ class AccountData:
     # provider exposes one. Disambiguates accounts a bank reports under an
     # identical name (issue #408). Never the full identifier — see mask_last4.
     masked_number: Optional[str] = None
+    shared_balance_group: Optional[str] = None
+    # The provider's session-independent identifier for this account, when it
+    # offers one. See `external_id` above: it is *supposed* to be stable, and
+    # Enable Banking is the provider that breaks that. This is the value that
+    # survives (EB's `identification_hash`), and the sync uses it to rebind the
+    # existing row to the new uid instead of duplicating the account.
+    stable_external_id: Optional[str] = None
+    # Per-account institution override (SimpleFIN — issue #345). None = same
+    # as connection. The external id is the provider's stable org id
+    # (SimpleFIN conn_id) so a renamed bank updates its row instead of
+    # minting a new one; name-only hints fall back to name identity.
+    institution_external_id: Optional[str] = None
+    institution_name: Optional[str] = None
+    institution_logo_url: Optional[str] = None
+    # Part of `balance` that the bank has auto-applied to an investment which
+    # the provider also reports as a holding (Pluggy
+    # `bankData.automaticallyInvestedBalance`, issue #843; a SimpleFIN
+    # brokerage, whose balance is the whole portfolio while its positions
+    # arrive as holdings, issue #343). Zero when unknown.
+    # The sync subtracts it only when a live holding is counted for this
+    # account (see connection_service._auto_invested_deductions), so the
+    # money is counted once: as the asset when one mirrors it, as cash
+    # otherwise.
+    auto_invested_balance: Decimal = Decimal(0)
+    # Provider-owned reserves, shown separately and never added to totals
+    # (ADR 0022). None = unreported or incomplete; keep stored rows.
+    # [] = explicitly reported, none active.
+    reserved_balances: Optional[list[ReservedBalanceData]] = None
+    # Credit still free on a card, when the provider reports it as a figure of
+    # its own instead of only the debt. Enable Banking reports a card from the
+    # account holder's side, and some banks (mBank PL, issue #624) put the
+    # credit limit in the booked balance, so the debt is only exact as
+    # `credit_limit - available_credit`. None = the provider said no such
+    # thing, and `balance` is the debt as usual.
+    available_credit: Optional[Decimal] = None
 
 
 @dataclass
@@ -79,6 +153,10 @@ class TransactionData:
     # Provider-side identifier of the bill this transaction belongs to.
     # Resolved to a credit_card_bills.id FK at sync time (issue #92).
     bill_external_id: Optional[str] = None
+    # Last four characters of the physical/virtual card used for this charge.
+    # This belongs to the transaction rather than the account because a single
+    # credit-card account can have additional or virtual cards. Never the PAN.
+    card_masked_number: Optional[str] = None
 
 
 @dataclass
@@ -142,8 +220,41 @@ class HoldingData:
     # belongs in a 3-char ISO currency field.
     ticker: Optional[str] = None
     maturity_date: Optional[date] = None
+    # Date the provider says `current_value` refers to. A provider can keep
+    # serving a frozen figure (a redeemed position it never reports as
+    # closed), so this date is the only sign that the value stopped moving.
+    # None = not reported by this provider.
+    value_date: Optional[date] = None
     is_withdrawn: bool = False  # provider signaled the position was sold/transferred
     metadata: Optional[dict] = None
+    # Owning-account hint (SimpleFIN — issue #345): holdings are reported per
+    # account, so each investment account gets its own wallet ("401(k)" apart
+    # from "Rollover IRA"). None = the connection-default wallet, for
+    # providers whose holdings aren't attributable to an account.
+    account_external_id: Optional[str] = None
+    account_name: Optional[str] = None
+    # Buys and sells of this holding, for providers that report them (plugin
+    # contract 1). None: not reported, the stored ledger is left alone.
+    trades: Optional[list["HoldingTradeData"]] = None
+    # What kind of investment it is ("stock", "etf", "fund", "crypto"), for
+    # providers that know. None: the generic "investment".
+    asset_type: Optional[str] = None
+
+
+@dataclass
+class HoldingTradeData:
+    """One buy or sell the provider reports for a holding.
+
+    `quantity` is always positive; `kind` gives the direction. `price` is per
+    unit in the asset's currency, and `fee` what executing the trade cost.
+    """
+
+    external_id: str
+    kind: Literal["buy", "sell"]
+    date: date
+    quantity: Decimal
+    price: Decimal
+    fee: Decimal = Decimal("0")
 
 
 @dataclass
@@ -192,6 +303,24 @@ class ProviderRateLimited(Exception):
     access (commonly ~4/day per resource), so a burst of syncs returns HTTP
     429. The connection is healthy; callers should skip this run and retry
     later rather than flag it as errored.
+
+    ``retry_after`` is the wait the provider asked for, in seconds, when it
+    sent one (``Retry-After``); None when it did not.
+    """
+
+    def __init__(self, message: str = "", retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class ProviderNotConfiguredError(Exception):
+    """Raised when a connection references a provider missing from the registry.
+
+    This is a server configuration problem, not a bank problem — typically one
+    process (e.g. the Celery worker) is not loading the environment that
+    enables the provider while the API process is. The credentials are fine,
+    so callers must not flip the connection to "error": the reconnect banner
+    would send the user chasing the wrong fix (and burning setup tokens).
     """
 
 
@@ -222,6 +351,15 @@ class BankProvider(ABC):
     to enable bank account syncing via OAuth or widget flow.
     """
 
+    def __init__(self, settings: Settings | None = None):
+        self._configured_settings = settings
+
+    @property
+    def settings(self) -> Settings:
+        from app.core.config import get_settings
+
+        return self._configured_settings or get_settings()
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -234,17 +372,25 @@ class BankProvider(ABC):
         return "oauth"
 
     @property
+    def rereads_by_date(self) -> bool:
+        """Whether ``get_transactions_by_date`` is implemented. The sync skips
+        the pending re-read, and the query behind it, when it is not."""
+        return False
+
+    @property
     def redirect_uri(self) -> str:
         """Provider-specific OAuth redirect URI.
 
         Each provider reads its own env var (e.g.
         ``PLUGGY_OAUTH_REDIRECT_URI``, ``ENABLE_BANKING_OAUTH_REDIRECT_URI``)
         so different providers can register different URLs in their
-        respective dashboards.
+        respective dashboards. When unset the URL is derived from
+        ``FRONTEND_URL`` so a non-default port or domain works out of the box.
         """
         from app.core.config import get_settings
 
-        return get_settings().pluggy_oauth_redirect_uri
+        settings = get_settings()
+        return settings.pluggy_oauth_redirect_uri or default_oauth_redirect_uri()
 
     async def create_connect_token(
         self, client_user_id: str, item_id: str | None = None
@@ -305,12 +451,40 @@ class BankProvider(ABC):
         """Fetch transactions for an account."""
         ...
 
+    async def get_transactions_by_date(
+        self, credentials: dict, account_external_id: str,
+        date_from: date, payee_source: str = "auto",
+    ) -> list[TransactionData]:
+        """Fetch every transaction dated on or after ``date_from``.
+
+        Providers whose ``get_transactions`` filters on something other than
+        the transaction date (Pluggy filters on ingestion time) override this
+        so the sync layer can re-read pending rows the incremental listing no
+        longer returns. The default returns nothing, which leaves the sync of
+        every other provider as it was.
+        """
+        return []
+
+    def parse_raw_transaction(
+        self, raw: dict, payee_source: str = "auto"
+    ) -> Optional[TransactionData]:
+        """Rebuild a transaction from the payload this provider stores in
+        ``raw_data``, or None when it can't.
+
+        A re-sync reads it on the payload stored before the new one is merged
+        in: where a row still holds what that payload gave, the user never
+        changed it, so a provider correction under the same id may replace
+        it. Providers whose ``raw_data`` is the whole entry override this;
+        the default leaves a known row's amount, type and payee as they are.
+        """
+        return None
+
     @abstractmethod
     async def refresh_credentials(self, credentials: dict) -> dict:
         """Refresh access token if needed."""
         ...
 
-    async def trigger_refresh(self, credentials: dict) -> RefreshOutcome:
+    async def trigger_refresh(self, credentials: dict | None) -> RefreshOutcome:
         """Ask the provider to pull fresh data from the underlying institution.
 
         Some aggregator providers cache the bank's data on their own side and

@@ -2,7 +2,8 @@ import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
 import path from 'node:path'
 import { defineConfig, loadEnv } from 'vite'
-import { resolveAppVersion } from './build/version'
+import { VitePWA } from 'vite-plugin-pwa'
+import { resolveAppVersion } from './build/version.ts'
 
 function getFrontendHost(frontendUrl?: string) {
   if (!frontendUrl) return []
@@ -11,12 +12,12 @@ function getFrontendHost(frontendUrl?: string) {
 }
 
 export default defineConfig(async ({ mode }) => {
-  const env = loadEnv(mode, __dirname, '')
+  const env = loadEnv(mode, import.meta.dirname, '')
   const frontendUrl = env.FRONTEND_URL || process.env.FRONTEND_URL
   const backendUrl = env.BACKEND_URL || process.env.BACKEND_URL
   const appVersionRoot = env.APP_VERSION_ROOT || process.env.APP_VERSION_ROOT
   const appVersion = await resolveAppVersion(
-    appVersionRoot || __dirname,
+    appVersionRoot || import.meta.dirname,
     env.VITE_APP_VERSION || process.env.VITE_APP_VERSION,
   )
 
@@ -25,6 +26,8 @@ export default defineConfig(async ({ mode }) => {
       __APP_VERSION__: JSON.stringify(appVersion),
     },
     build: {
+      // Keep the existing per-chunk budget; optional locales load on demand.
+      chunkSizeWarningLimit: 1000,
       // Emit hashed JS/CSS into `static/` instead of Vite's default `assets/`.
       // The default collides with our `/assets` SPA route: nginx's
       // `try_files $uri $uri/ /index.html` matches the real `dist/assets/`
@@ -33,10 +36,35 @@ export default defineConfig(async ({ mode }) => {
       // page instead of booting the app (issue #295).
       assetsDir: 'static',
     },
-    plugins: [react(), tailwindcss()],
+    plugins: [
+      react(),
+      tailwindcss(),
+      // Service worker (Workbox generateSW). The web manifest is the
+      // hand-written public/manifest.json, so the plugin doesn't generate one.
+      // The whole build output is precached, so the app opens offline right
+      // after install. /api is never cached nor answered with the shell
+      // fallback, so no financial data is stored offline.
+      VitePWA({
+        registerType: 'autoUpdate',
+        manifest: false,
+        workbox: {
+          // `mjs` covers the PDF.js worker emitted into static/ (the attachment
+          // preview needs it offline); `json` covers the hand-written
+          // manifest.json copied from public/ (issue #201).
+          globPatterns: ['**/*.{js,css,html,png,ico,mjs,json}'],
+          // Workbox skips any asset over 2 MiB by default, and the PDF.js
+          // worker is ~2.17 MiB, so the default would leave it out even with
+          // the pattern above. Leave headroom above its current size.
+          maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
+          navigateFallback: '/index.html',
+          navigateFallbackDenylist: [/^\/api\//, /^\/i\//],
+          cleanupOutdatedCaches: true,
+        },
+      }),
+    ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, './src'),
+        '@': path.resolve(import.meta.dirname, './src'),
       },
     },
     server: {

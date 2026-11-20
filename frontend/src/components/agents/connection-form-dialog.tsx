@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -16,6 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch'
 import { agents } from '@/lib/api'
 import type { LlmConnection, LlmConnectionKind } from '@/lib/api'
+import { extractApiError } from '@/lib/api-errors'
 
 interface Props {
   open: boolean
@@ -61,7 +62,9 @@ export function ConnectionFormDialog({ open, onOpenChange, connection }: Props) 
     setDefaultModel(KIND_LABELS[newKind].defaultModel ?? '')
   }
 
-  useEffect(() => {
+  const [formSource, setFormSource] = useState<{ connection: typeof connection; open: typeof open } | null>(null)
+  if (!formSource || formSource.connection !== connection || formSource.open !== open) {
+    setFormSource({ connection, open })
     if (connection) {
       setName(connection.name)
       setKind(connection.kind)
@@ -86,7 +89,7 @@ export function ConnectionFormDialog({ open, onOpenChange, connection }: Props) 
       setModelTouched(false)
       setIsDefault(false)
     }
-  }, [connection, open])
+  }
 
   const meta = KIND_LABELS[kind]
 
@@ -113,8 +116,7 @@ export function ConnectionFormDialog({ open, onOpenChange, connection }: Props) 
       toast.success(isEdit ? t('agents.connections.updated') : t('agents.connections.created'))
     },
     onError: (err: unknown) => {
-      const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
-      toast.error(detail || t('agents.connections.saveFailed'))
+      toast.error(extractApiError(err, t('agents.connections.saveFailed')))
     },
   })
 
@@ -159,7 +161,7 @@ export function ConnectionFormDialog({ open, onOpenChange, connection }: Props) 
           <div className="grid gap-2">
             <Label>
               {t('agents.connections.baseUrl')}
-              {!meta.needsBaseUrl && <span className="text-xs text-muted-foreground ml-1">({t('agents.connections.optional')})</span>}
+              {!meta.needsBaseUrl && <span className="text-xs text-muted-foreground ms-1">({t('agents.connections.optional')})</span>}
             </Label>
             <Input
               value={baseUrl}
@@ -180,7 +182,7 @@ export function ConnectionFormDialog({ open, onOpenChange, connection }: Props) 
           <div className="grid gap-2">
             <Label>
               {t('agents.connections.apiKey')}
-              {!meta.needsKey && <span className="text-xs text-muted-foreground ml-1">({t('agents.connections.optional')})</span>}
+              {!meta.needsKey && <span className="text-xs text-muted-foreground ms-1">({t('agents.connections.optional')})</span>}
             </Label>
             <Input
               type="password"

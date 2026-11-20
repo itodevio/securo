@@ -1,9 +1,9 @@
 import uuid
-from datetime import date, datetime
+from datetime import date as _date, datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class AssetCreate(BaseModel):
@@ -12,27 +12,40 @@ class AssetCreate(BaseModel):
     currency: str = "USD"
     units: Optional[Decimal] = None
     valuation_method: str = "manual"
-    purchase_date: Optional[date] = None
+    purchase_date: Optional[_date] = None
     purchase_price: Optional[Decimal] = None
-    sell_date: Optional[date] = None
+    sell_date: Optional[_date] = None
     sell_price: Optional[Decimal] = None
     current_value: Optional[Decimal] = None  # convenience: creates initial AssetValue
     growth_type: Optional[str] = None
     growth_rate: Optional[Decimal] = None
     growth_frequency: Optional[str] = None
-    growth_start_date: Optional[date] = None
+    growth_start_date: Optional[_date] = None
     is_archived: bool = False
     position: int = 0
     group_id: Optional[uuid.UUID] = None
+    external_id: Optional[str] = None
     # Market-priced assets: ticker is enough to create one. The service
     # fetches the live quote on create and seeds the first AssetValue.
     ticker: Optional[str] = None
     ticker_exchange: Optional[str] = None
-    maturity_date: Optional[date] = None
+    maturity_date: Optional[_date] = None
     # Per-unit price for the opening buy of a market-priced holding (preço
     # médio model, consistent with the transaction ledger). When omitted, the
     # service seeds the buy at the live quote ("bought at market now").
     unit_price: Optional[Decimal] = None
+
+    @field_validator("external_id")
+    @classmethod
+    def normalize_external_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("external_id must not be blank")
+        if len(normalized) > 255:
+            raise ValueError("external_id must be at most 255 characters")
+        return normalized
 
 
 class AssetUpdate(BaseModel):
@@ -41,14 +54,14 @@ class AssetUpdate(BaseModel):
     currency: Optional[str] = None
     units: Optional[Decimal] = None
     valuation_method: Optional[str] = None
-    purchase_date: Optional[date] = None
+    purchase_date: Optional[_date] = None
     purchase_price: Optional[Decimal] = None
-    sell_date: Optional[date] = None
+    sell_date: Optional[_date] = None
     sell_price: Optional[Decimal] = None
     growth_type: Optional[str] = None
     growth_rate: Optional[Decimal] = None
     growth_frequency: Optional[str] = None
-    growth_start_date: Optional[date] = None
+    growth_start_date: Optional[_date] = None
     is_archived: Optional[bool] = None
     position: Optional[int] = None
     # Use a sentinel to differentiate "don't change group" (field omitted)
@@ -67,14 +80,14 @@ class AssetRead(BaseModel):
     currency: str
     units: Optional[float] = None
     valuation_method: str
-    purchase_date: Optional[date] = None
+    purchase_date: Optional[_date] = None
     purchase_price: Optional[float] = None
-    sell_date: Optional[date] = None
+    sell_date: Optional[_date] = None
     sell_price: Optional[float] = None
     growth_type: Optional[str] = None
     growth_rate: Optional[float] = None
     growth_frequency: Optional[str] = None
-    growth_start_date: Optional[date] = None
+    growth_start_date: Optional[_date] = None
     is_archived: bool
     position: int
     current_value: Optional[float] = None
@@ -83,15 +96,19 @@ class AssetRead(BaseModel):
     gain_loss_primary: Optional[float] = None
     value_count: int = 0
     source: str = "manual"
+    external_id: Optional[str] = None
     connection_id: Optional[uuid.UUID] = None
     isin: Optional[str] = None
-    maturity_date: Optional[date] = None
+    maturity_date: Optional[_date] = None
     group_id: Optional[uuid.UUID] = None
     ticker: Optional[str] = None
     ticker_exchange: Optional[str] = None
     last_price: Optional[float] = None
     last_price_at: Optional[datetime] = None
     logo_url: Optional[str] = None
+    # Date the sync provider says current_value refers to. Lets the UI flag a
+    # synced position whose provider stopped updating the value.
+    provider_value_date: Optional[_date] = None
     # Ledger-derived fields (issue #235). average_price = weighted-average cost
     # per unit (preço médio); total_invested = cost basis of the held units;
     # realized_gain = cumulative gain/loss from sells; transaction_count lets
@@ -105,12 +122,15 @@ class AssetRead(BaseModel):
 
 
 class AssetTransactionCreate(BaseModel):
-    kind: str  # buy | sell
-    quantity: Decimal
-    price: Decimal
+    kind: str  # buy | sell | split
+    quantity: Optional[Decimal] = None  # required for a buy or sell
+    price: Optional[Decimal] = None  # required for a buy or sell
     fee: Decimal = Decimal("0")
-    date: date
+    date: _date
     notes: Optional[str] = None
+    # Split only: units held before → after (a 100-for-1 split is 1 → 100).
+    old_units: Optional[int] = None
+    new_units: Optional[int] = None
 
 
 class AssetTransactionUpdate(BaseModel):
@@ -118,8 +138,10 @@ class AssetTransactionUpdate(BaseModel):
     quantity: Optional[Decimal] = None
     price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
-    date: Optional[date] = None
+    date: Optional[_date] = None
     notes: Optional[str] = None
+    old_units: Optional[int] = None
+    new_units: Optional[int] = None
 
 
 class AssetBuyCreate(BaseModel):
@@ -129,7 +151,7 @@ class AssetBuyCreate(BaseModel):
     quantity: Decimal
     price: Decimal
     fee: Decimal = Decimal("0")
-    date: date
+    date: _date
     name: Optional[str] = None
     group_id: Optional[uuid.UUID] = None
     notes: Optional[str] = None
@@ -142,9 +164,12 @@ class AssetTransactionRead(BaseModel):
     quantity: float
     price: float
     fee: float
-    date: date
+    date: _date
     source: str
     notes: Optional[str] = None
+    # Split only: the units held before and after it (null on buys and sells).
+    old_units: Optional[int] = None
+    new_units: Optional[int] = None
     # Denormalized holding context so the global transactions tab can render
     # rows without an extra per-row asset lookup.
     asset_name: Optional[str] = None
@@ -169,6 +194,18 @@ class MarketSymbolQuote(BaseModel):
     logo_url: Optional[str] = None
 
 
+class AssetPriceRefreshResult(BaseModel):
+    """Outcome of a portfolio-wide price refresh (issue #778).
+
+    Same counters the scheduled task returns, so the UI can say how many
+    holdings actually got a new quote instead of claiming success blindly.
+    """
+
+    refreshed: int
+    skipped: int
+    rate_limited: int
+
+
 class MarketSymbolMatch(BaseModel):
     """A single search result returned by /assets/market/search."""
 
@@ -180,14 +217,14 @@ class MarketSymbolMatch(BaseModel):
 
 class AssetValueCreate(BaseModel):
     amount: Decimal
-    date: date
+    date: _date
 
 
 class AssetValueRead(BaseModel):
     id: uuid.UUID
     asset_id: uuid.UUID
     amount: float
-    date: date
+    date: _date
     source: str
 
     model_config = ConfigDict(from_attributes=True)

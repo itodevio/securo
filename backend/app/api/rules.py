@@ -16,24 +16,44 @@ from app.schemas.rule import (
     RuleImportRequest,
     RuleImportResponse,
     RuleMutationResponse,
+    RulePackRead,
+    RulePackRemovalRead,
+    RulePreviewRequest,
+    RulePreviewResponse,
     RuleRead,
     RuleUpdate,
 )
 from app.services import rule_service
+from app.plugins.sync import SyncPlanChanged
+from app.services import rule_packs
+from app.services.rule_packs import get_pack
 from app.services.rule_service import DuplicateRuleError
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
 
 
-def _normalize_conditions(conditions: list[dict]) -> list[dict]:
-    return [
-        {
-            "field": condition.get("field"),
+def _normalize_condition(condition: dict) -> dict:
+    """Reduce one condition list entry to the keys that decide what it matches.
+
+    A group entry carries its own operator and leaves instead of a field, so it
+    has to be normalized recursively — flattening it to `field: None` would make
+    every group compare equal and hide real edits from the change check below.
+    """
+    nested = condition.get("conditions")
+    if isinstance(nested, list):
+        return {
             "op": condition.get("op"),
-            "value": condition.get("value"),
+            "conditions": [_normalize_condition(c) for c in nested],
         }
-        for condition in conditions
-    ]
+    return {
+        "field": condition.get("field"),
+        "op": condition.get("op"),
+        "value": condition.get("value"),
+    }
+
+
+def _normalize_conditions(conditions: list[dict]) -> list[dict]:
+    return [_normalize_condition(condition) for condition in conditions]
 
 
 def _rule_match_definition_changed(rule: RuleRead, data: RuleUpdate) -> bool:
@@ -95,6 +115,31 @@ async def create_rule(
     return response
 
 
+@router.post("/preview", response_model=RulePreviewResponse)
+async def preview_rule(
+    data: RulePreviewRequest,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Show which existing transactions a draft rule would match, and how it
+    would change them, without saving anything."""
+    try:
+        return await rule_service.preview_rule(
+            session,
+            ctx.workspace.id,
+            data.conditions_op,
+            [c.model_dump() for c in data.conditions],
+            [a.model_dump() for a in data.actions],
+            is_active=data.is_active,
+            apply_to_existing=data.apply_to_existing,
+            overwrite_existing_categories=data.overwrite_existing_categories,
+            limit=data.limit,
+            offset=data.offset,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
 @router.get("/export")
 async def export_rules(
     ctx: WorkspaceContext = Depends(current_workspace),
@@ -143,7 +188,7 @@ async def update_rule(
     if not current_rule:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
     if data.apply_to_existing is None:
-        should_apply = _rule_match_definition_changed(current_rule, data)
+        should_apply = _rule_match_definition_changed(RuleRead.model_validate(current_rule), data)
     else:
         should_apply = data.apply_to_existing
 
@@ -184,25 +229,25 @@ async def delete_rule(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule not found")
 
 
-@router.get("/packs", response_model=list[dict])
+@router.get("/packs", response_model=list[RulePackRead])
 async def list_rule_packs(
     ctx: WorkspaceContext = Depends(current_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    """List available country-specific rule packs with installed status."""
-    installed_map = await rule_service.get_installed_packs(
-        session, ctx.workspace.id, ctx.user_id
-    )
-    packs = []
-    for code, pack in rule_service.RULE_PACKS.items():
-        packs.append({
-            "code": code,
-            "name": pack["name"],
-            "flag": pack["flag"],
-            "rule_count": len(pack["rules"]),
-            "installed": installed_map.get(code, False),
-        })
-    return packs
+    """The built-in rule packs and where this workspace stands with each."""
+    statuses = await rule_packs.list_rule_packs(session, ctx.workspace.id)
+    return [
+        RulePackRead(
+            code=s.pack.code,
+            name=s.pack.name,
+            names=s.pack.names,
+            flag=s.pack.flag,
+            rule_count=len(s.pack.rules),
+            installed=s.installed,
+            rules_from_pack=s.rules_from_pack,
+        )
+        for s in statuses
+    ]
 
 
 @router.post("/packs/{pack_code}/install", response_model=dict)
@@ -217,10 +262,10 @@ async def install_rule_pack(
     `create_missing_categories=true` opts into seeding any default
     categories the pack needs that the user doesn't already have.
     """
-    if pack_code not in rule_service.RULE_PACKS:
+    if get_pack(pack_code) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule pack not found")
     lang = (ctx.user.preferences or {}).get("language", "pt-BR")
-    result = await rule_service.install_rule_pack(
+    result = await rule_packs.install_rule_pack(
         session,
         ctx.workspace.id,
         ctx.user_id,
@@ -233,6 +278,44 @@ async def install_rule_pack(
         "unresolved": result.unresolved,
         "categories_created": result.categories_created,
     }
+
+
+@router.get("/packs/{pack_code}/removal", response_model=RulePackRemovalRead)
+async def preview_rule_pack_removal(
+    pack_code: str,
+    ctx: WorkspaceContext = Depends(current_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """What removing the pack would delete, and which edited rules it keeps."""
+    removal = await rule_packs.plan_rule_pack_removal(session, ctx.workspace.id, pack_code)
+    if removal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule pack not found")
+    return removal
+
+
+@router.delete("/packs/{pack_code}", response_model=RulePackRemovalRead)
+async def remove_rule_pack(
+    pack_code: str,
+    token: str,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """Remove a pack's untouched rules. Edited rules stay as the user's own,
+    and transactions keep the categories the rules already gave them.
+
+    `token` comes from the removal preview; if the plan changed since, the
+    answer is 409 and nothing is removed.
+    """
+    try:
+        removal = await rule_packs.remove_rule_pack(session, ctx.workspace.id, ctx.user_id, pack_code, token)
+    except SyncPlanChanged:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The pack's rules changed since the preview. Review the removal again.",
+        )
+    if removal is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rule pack not found")
+    return removal
 
 
 @router.post("/apply-all", response_model=dict)

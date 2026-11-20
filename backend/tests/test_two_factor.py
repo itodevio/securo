@@ -1,8 +1,12 @@
-from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pyotp
 import pytest
 from httpx import AsyncClient
+
+from app.api.two_factor import _verify_totp
+from app.core.auth import get_jwt_strategy
 
 
 def _make_redis_mock_with_store():
@@ -24,11 +28,7 @@ def _make_redis_mock_with_store():
     mock.delete = AsyncMock(side_effect=mock_delete)
 
     # Pipeline for rate limiter (always allow)
-    pipe_mock = AsyncMock()
-    pipe_mock.zremrangebyscore = AsyncMock()
-    pipe_mock.zcard = AsyncMock()
-    pipe_mock.zadd = AsyncMock()
-    pipe_mock.expire = AsyncMock()
+    pipe_mock = MagicMock()
     pipe_mock.execute = AsyncMock(return_value=[0, 0, True, True])
     mock.pipeline = lambda: pipe_mock
 
@@ -59,6 +59,68 @@ async def test_setup_2fa(client: AsyncClient, auth_headers: dict):
     assert "otpauth://totp/" in data["otpauth_uri"]
 
 
+async def test_setup_2fa_refused_when_already_enabled(
+    client: AsyncClient,
+    test_user,
+    session,
+    auth_headers: dict,
+):
+    secret = pyotp.random_base32()
+    test_user.totp_secret = secret
+    test_user.is_2fa_enabled = True
+    session.add(test_user)
+    await session.commit()
+
+    response = await client.post("/api/auth/2fa/setup", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "2FA is already enabled"
+    await session.refresh(test_user)
+    assert test_user.totp_secret == secret
+    assert test_user.is_2fa_enabled is True
+
+
+@pytest.mark.parametrize("path", ["/api/auth/2fa/setup", "/api/auth/2fa/enable"])
+async def test_totp_enrollment_forbidden_when_local_auth_disabled(
+    client: AsyncClient,
+    test_user,
+    oidc_only_settings,
+    path: str,
+):
+    token = await get_jwt_strategy().write_token(test_user)
+    response = await client.post(
+        path,
+        json={"code": "123456"} if path.endswith("/enable") else None,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "LOCAL_AUTH_DISABLED"
+
+
+async def test_disable_2fa_allowed_for_cleanup_when_local_auth_disabled(
+    client: AsyncClient,
+    test_user,
+    session,
+    oidc_only_settings,
+):
+    secret = pyotp.random_base32()
+    test_user.totp_secret = secret
+    test_user.is_2fa_enabled = True
+    session.add(test_user)
+    await session.commit()
+
+    token = await get_jwt_strategy().write_token(test_user)
+    response = await client.post(
+        "/api/auth/2fa/disable",
+        json={"password": "testpass123", "code": pyotp.TOTP(secret).now()},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == "2FA disabled"
+
+
 async def test_enable_2fa(client: AsyncClient, auth_headers: dict, test_user):
     # First setup
     setup_resp = await client.post("/api/auth/2fa/setup", headers=auth_headers)
@@ -87,6 +149,21 @@ async def test_enable_2fa_invalid_code(client: AsyncClient, auth_headers: dict, 
         headers=auth_headers,
     )
     assert response.status_code == 400
+
+
+def test_verify_totp_allows_adjacent_time_windows():
+    secret = pyotp.random_base32()
+    fixed_time = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+    totp = pyotp.TOTP(secret)
+    previous_code = totp.at(fixed_time, counter_offset=-1)
+    next_code = totp.at(fixed_time, counter_offset=1)
+    distant_code = totp.at(fixed_time, counter_offset=2)
+
+    # The time is handed to pyotp instead of freezing the clock it reads
+    # internally, which moved from datetime.now() to time.time() in 2.12.
+    assert _verify_totp(secret, previous_code, for_time=fixed_time)
+    assert _verify_totp(secret, next_code, for_time=fixed_time)
+    assert not _verify_totp(secret, distant_code, for_time=fixed_time)
 
 
 async def test_login_with_2fa(client: AsyncClient, test_user_with_2fa):
@@ -202,7 +279,7 @@ async def test_verify_2fa_with_valid_token(client: AsyncClient, test_user_with_2
     mock_r = AsyncMock()
     mock_r.get = AsyncMock(return_value=str(test_user_with_2fa.id))
     mock_r.delete = AsyncMock()
-    pipe = AsyncMock()
+    pipe = MagicMock()
     pipe.execute = AsyncMock(return_value=[0, 0, True, True])
     mock_r.pipeline = lambda: pipe
 

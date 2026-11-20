@@ -1,9 +1,9 @@
 import uuid
 from datetime import date as _date, datetime, timezone
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, cast
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, JSON, Numeric, SmallInteger, String, event
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, JSON, Numeric, SmallInteger, String, event, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -18,10 +18,29 @@ if TYPE_CHECKING:
     from app.models.recurring_transaction import RecurringTransaction
     from app.models.transaction_attachment import TransactionAttachment
     from app.models.transaction_split import TransactionSplit
+    from app.models.transaction_category_line import TransactionCategoryLine
+
+
+#: Key a pending synced row carries in `raw_data` once the user edited its
+#: category or payee. The bank sync reads it before expiring a hold it
+#: dropped: the edit is the user's work even when the value later went back
+#: to the one the sync gave.
+USER_EDITED_KEY = "securo_user_edited"
 
 
 class Transaction(Base):
     __tablename__ = "transactions"
+    __table_args__ = (
+        # Declared here so autogenerate keeps migration 120's composite index.
+        Index("ix_transactions_account_card_masked_number", "account_id", "card_masked_number"),
+        # Migration 124: the flagged views and their counts read only flagged rows.
+        Index(
+            "ix_transactions_flagged",
+            "workspace_id",
+            "flag_due_date",
+            postgresql_where=text("is_flagged"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
@@ -32,6 +51,10 @@ class Transaction(Base):
     category_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("categories.id"), nullable=True)
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # Provider's transaction ID
     description: Mapped[str] = mapped_column(String(500))
+    original_description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    description_is_rule_managed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
     amount: Mapped[Decimal] = mapped_column(Numeric(precision=15, scale=2))
     currency: Mapped[str] = mapped_column(String(3), default="USD")
     date: Mapped[_date] = mapped_column(Date)
@@ -40,6 +63,10 @@ class Transaction(Base):
     # the transaction belongs to — so accrual-mode aggregations count the
     # purchase when it hits the user's cash, not when it was made.
     effective_date: Mapped[_date] = mapped_column(Date, index=True)
+    # Optional user correction for report-period attribution. The provider
+    # `date` remains immutable bank truth; this field only affects reporting
+    # bucketing and is deliberately ignored by sync, balances, matching, and FX.
+    reporting_date_override: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
     type: Mapped[str] = mapped_column(String(10))  # debit, credit
     source: Mapped[str] = mapped_column(String(20))  # sync, ofx, csv, manual
     status: Mapped[str] = mapped_column(String(10), default="posted")  # posted, pending
@@ -49,8 +76,24 @@ class Transaction(Base):
     raw_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     import_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("import_logs.id"), nullable=True)
     transfer_pair_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # True on both legs of a cross-currency transfer whose destination amount
+    # the user typed in, instead of letting it be converted at the market rate.
+    # Both amounts are then observed facts, so editing one leg must not
+    # re-derive the other from an FX rate.
+    transfer_amount_explicit: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
     amount_primary: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
     fx_rate_used: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=20, scale=10), nullable=True)
+    # The row's value in its account's currency, for a row in another currency
+    # than its account (ADR 0027). Balances and bills read it; NULL on a row
+    # already in the account's currency, and on one not converted yet.
+    amount_account: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=15, scale=2), nullable=True)
+    # Where `amount_account` came from: "bank" (the provider's charge), "user"
+    # (typed in the transaction dialog), or NULL when derived from a rate.
+    # Only a derived value is worked out again when nothing about the row
+    # changed (ADR 0027).
+    amount_account_source: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
     # Installment (parcelamento) metadata. Populated from provider data when available.
     # `installment_number` is 1-indexed (e.g. 3 for "3/12"). Storing alongside the
     # raw tx row so the door stays open to a plan view or manual entry later
@@ -61,6 +104,12 @@ class Transaction(Base):
         Numeric(precision=15, scale=2), nullable=True
     )
     installment_purchase_date: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    # Stable identity for rows created by the manual installment-series
+    # endpoint. Provider-synced installment rows leave this null because their
+    # metadata is only a deduplication fingerprint, not a series identifier.
+    installment_series_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
     # User-set manual override for which bill cycle this tx belongs to. Null
     # by default; only meaningful for credit-card accounts. When set, beats
     # both Pluggy's billId and the cycle-math fallback (issue #92, the
@@ -77,9 +126,38 @@ class Transaction(Base):
         nullable=True,
         index=True,
     )
-    # Flag to exclude this transaction from reports and dashboard aggregations.
-    # When set to True, the transaction is ignored for income/expense calculations.
+    # Last four characters of the physical/virtual card that made this charge.
+    # A credit-card account can represent multiple additional or virtual cards,
+    # so this belongs to the transaction rather than Account.masked_number.
+    # Never store the complete card number here.
+    card_masked_number: Mapped[Optional[str]] = mapped_column(String(4), nullable=True)
+    # Ignore the row everywhere monetary totals are calculated, including the
+    # account balance. The row remains stored and can still be shown in ledger
+    # views unless the caller explicitly hides ignored transactions.
     is_ignored: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Keep the row in the ledger and current balance, but leave it out of P&L
+    # reports. This differs from is_ignored, which also removes the row from
+    # balance calculations. Balance adjustments use this distinction so the
+    # reconciled balance stays exact without looking like income or spending.
+    exclude_from_pnl: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    # A marker the user sets to come back to a row later (issue #56), with an
+    # optional reminder date and note. Only the flagged views read them; no
+    # total, balance or report does. Both are cleared with the flag.
+    is_flagged: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    flag_due_date: Mapped[Optional[_date]] = mapped_column(Date, nullable=True)
+    flag_note: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # True while the amount is split across several categories, kept in
+    # `category_lines`. `category_id` is null for those rows, which every
+    # other path reads as "uncategorized"; this flag is how rules, sync and
+    # bulk edits tell the two apart without a subquery. Written only by
+    # category_line_service.
+    has_category_lines: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
     # Link to the recurring bill this transaction fulfills (issue #116). Set when
     # a synced/imported/manual charge is matched to a recurring bill, or stamped
     # onto the placeholder generate_pending materializes. ON DELETE SET NULL: if
@@ -91,6 +169,12 @@ class Transaction(Base):
         index=True,
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    @property
+    def provider_category(self) -> Optional[str]:
+        if not isinstance(self.raw_data, dict):
+            return None
+        return self.raw_data.get("category")
 
     account: Mapped["Account"] = relationship(back_populates="transactions")
     category: Mapped[Optional["Category"]] = relationship()
@@ -106,6 +190,28 @@ class Transaction(Base):
     splits: Mapped[list["TransactionSplit"]] = relationship(
         back_populates="transaction", cascade="all, delete-orphan"
     )
+    # Loaded with every transaction: an unsplit row costs one empty IN query,
+    # and any response that serializes a row needs its lines.
+    category_lines: Mapped[list["TransactionCategoryLine"]] = relationship(
+        back_populates="transaction",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="TransactionCategoryLine.position",
+        lazy="selectin",
+    )
+
+    # Populated dynamically by the service (not DB columns).
+    is_shared: bool = False
+    viewer_share = cast(Optional[Decimal], None)
+    group_id = cast(Optional[uuid.UUID], None)
+    parent_owner_name = cast(Optional[str], None)
+    attachment_count: int = 0
+    payee_name = cast(Optional[str], None)
+    running_balance = cast(Optional[float], None)
+    running_balance_primary = cast(Optional[float], None)
+    matched_amount = cast(Optional[Decimal], None)
+    matched_amount_primary = cast(Optional[Decimal], None)
+    reporting_date = cast(Optional[_date], None)
 
 
 # Safety net: `effective_date` is NOT NULL. For non-CC transactions it always
@@ -113,12 +219,12 @@ class Transaction(Base):
 # silently. CC-aware service code still calls `apply_effective_date` explicitly
 # so that cycle-based due dates are stored when the account has the metadata.
 @event.listens_for(Transaction, "before_insert")
-def _default_effective_date(mapper, connection, target):  # type: ignore
+def _default_effective_date(mapper, connection, target):
     if target.effective_date is None:
         target.effective_date = target.date
 
 
 @event.listens_for(Transaction, "before_update")
-def _default_effective_date_on_update(mapper, connection, target):  # type: ignore
+def _default_effective_date_on_update(mapper, connection, target):
     if target.effective_date is None:
         target.effective_date = target.date

@@ -1,3 +1,4 @@
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID
@@ -19,15 +20,31 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
         UniqueConstraint("oidc_issuer", "oidc_subject", name="uq_users_oidc_identity"),
     )
 
+    if TYPE_CHECKING:
+        # fastapi-users declares its inherited columns as plain types (e.g.
+        # `email: str`) under its own TYPE_CHECKING branch, so `ty` can't see
+        # them as SQLAlchemy `Mapped` attributes (`.ilike()`, `.in_()`, ...).
+        # Re-annotate them here so type checkers treat them as real mapped
+        # columns everywhere.
+        id: Mapped[uuid.UUID]
+        email: Mapped[str]
+        hashed_password: Mapped[str]
+        is_active: Mapped[bool]
+        is_superuser: Mapped[bool]
+        is_verified: Mapped[bool]
+
     preferences: Mapped[Optional[dict]] = mapped_column(
         JSON,
         default=lambda: {
             "language": "en",
             "date_format": "MM/DD/YYYY",
-            "timezone": "UTC",
             "currency_display": "USD",
         },
     )
+
+    # The appearance this person chose (a theme id from the library). None is
+    # Securo's own look, with the instance's accent colors if an admin set them.
+    theme: Mapped[Optional[str]] = mapped_column(String(160), nullable=True, default=None)
 
     totp_secret: Mapped[Optional[str]] = mapped_column(String(32), nullable=True, default=None)
     is_2fa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
@@ -38,6 +55,22 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     category_groups: Mapped[list["CategoryGroup"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     bank_connections: Mapped[list["BankConnection"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     passkeys: Mapped[list["UserPasskey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+    @property
+    def display_name(self) -> Optional[str]:
+        """The name this person chose, when they set one.
+
+        Callers that show a person anywhere the email is the only other
+        identifier fall back to the email themselves; anything offered by
+        an API that names people should carry this.
+        """
+        prefs = self.preferences or {}
+        # Preferences is a JSON column, so the value is only a string because
+        # the writers put one there; anything else is not a name.
+        name = prefs.get("display_name")
+        if not isinstance(name, str):
+            return None
+        return name.strip() or None
 
     @property
     def primary_currency(self) -> str:

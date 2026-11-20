@@ -8,10 +8,12 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
+from app.models.account_card import AccountCard
 from app.models.transaction import Transaction
 from app.models.category import Category
 from app.models.payee import Payee
 from app.models.user import User
+from app.models.workspace import Workspace
 
 
 @pytest.mark.asyncio
@@ -52,6 +54,149 @@ async def test_list_transactions_filter_by_account(
     assert response.status_code == 200
     data = response.json()
     assert data["total"] == 5  # all belong to same account
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_filter_by_linked_card(
+    client: AsyncClient, auth_headers, session: AsyncSession, test_user, test_workspace
+):
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Cartão",
+        type="credit_card",
+        balance=Decimal("0"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    personal_card = AccountCard(
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        masked_number="5062",
+        label="Pessoal",
+    )
+    virtual_card = AccountCard(
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        masked_number="7266",
+    )
+    same_ending_account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Second card account",
+        type="credit_card",
+        balance=Decimal("0"),
+        currency="BRL",
+    )
+    other_workspace = Workspace(name="Other workspace", created_by_user_id=test_user.id)
+    session.add_all([personal_card, virtual_card, same_ending_account, other_workspace])
+    await session.flush()
+    same_ending_card = AccountCard(
+        workspace_id=test_workspace.id,
+        account_id=same_ending_account.id,
+        masked_number="5062",
+    )
+    other_workspace_account = Account(
+        user_id=test_user.id,
+        workspace_id=other_workspace.id,
+        name="Other workspace card account",
+        type="credit_card",
+        balance=Decimal("0"),
+        currency="BRL",
+    )
+    session.add(other_workspace_account)
+    await session.flush()
+    other_workspace_card = AccountCard(
+        workspace_id=other_workspace.id,
+        account_id=other_workspace_account.id,
+        masked_number="5062",
+    )
+    session.add_all([same_ending_card, other_workspace_card])
+    session.add_all([
+        Transaction(
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=account.id,
+            description="Personal purchase",
+            amount=Decimal("10"),
+            currency="BRL",
+            date=date.today(),
+            type="debit",
+            source="sync",
+            card_masked_number="5062",
+        ),
+        Transaction(
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=account.id,
+            description="Virtual purchase",
+            amount=Decimal("20"),
+            currency="BRL",
+            date=date.today(),
+            type="debit",
+            source="sync",
+            card_masked_number="7266",
+        ),
+        Transaction(
+            user_id=test_user.id,
+            workspace_id=test_workspace.id,
+            account_id=same_ending_account.id,
+            description="Same ending, other account",
+            amount=Decimal("30"),
+            currency="BRL",
+            date=date.today(),
+            type="debit",
+            source="sync",
+            card_masked_number="5062",
+        ),
+        Transaction(
+            user_id=test_user.id,
+            workspace_id=other_workspace.id,
+            account_id=other_workspace_account.id,
+            description="Same ending, other workspace",
+            amount=Decimal("40"),
+            currency="BRL",
+            date=date.today(),
+            type="debit",
+            source="sync",
+            card_masked_number="5062",
+        ),
+    ])
+    await session.commit()
+
+    response = await client.get(
+        f"/api/transactions?linked_card_ids={personal_card.id}",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["total"] == 1
+    assert response.json()["items"][0]["description"] == "Personal purchase"
+
+    exported = await client.get(
+        f"/api/transactions/export?linked_card_ids={personal_card.id}",
+        headers=auth_headers,
+    )
+    assert exported.status_code == 200
+    assert "Personal purchase" in exported.text
+    assert "Virtual purchase" not in exported.text
+    assert "Same ending, other account" not in exported.text
+    assert "Same ending, other workspace" not in exported.text
+
+    foreign_card_response = await client.get(
+        f"/api/transactions?linked_card_ids={other_workspace_card.id}",
+        headers=auth_headers,
+    )
+    assert foreign_card_response.status_code == 200
+    assert foreign_card_response.json()["total"] == 0
+
+    foreign_card_export = await client.get(
+        f"/api/transactions/export?linked_card_ids={other_workspace_card.id}",
+        headers=auth_headers,
+    )
+    assert foreign_card_export.status_code == 200
+    assert "Personal purchase" not in foreign_card_export.text
+    assert "Same ending, other workspace" not in foreign_card_export.text
 
 
 @pytest.mark.asyncio
@@ -370,6 +515,43 @@ async def test_create_transaction(
     assert data["description"] == "Almoço restaurante"
     assert data["source"] == "manual"
     assert data["category_id"] == str(test_categories[0].id)
+    assert data["external_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_transaction_persists_external_id(
+    client: AsyncClient, auth_headers, test_account: Account, test_categories: list[Category]
+):
+    response = await client.post(
+        "/api/transactions",
+        headers=auth_headers,
+        json={
+            "account_id": str(test_account.id),
+            "category_id": str(test_categories[0].id),
+            "description": "External ID transaction",
+            "amount": "32.50",
+            "date": "2026-02-20",
+            "type": "debit",
+            "external_id": "client-tx-api-001",
+        },
+    )
+    assert response.status_code == 201
+    created = response.json()
+    assert created["external_id"] == "client-tx-api-001"
+
+    transaction_id = created["id"]
+    response = await client.get(
+        f"/api/transactions/{transaction_id}", headers=auth_headers
+    )
+    assert response.status_code == 200
+    assert response.json()["external_id"] == "client-tx-api-001"
+
+    response = await client.get(
+        f"/api/transactions?account_id={test_account.id}", headers=auth_headers
+    )
+    assert response.status_code == 200
+    listed = next(item for item in response.json()["items"] if item["id"] == transaction_id)
+    assert listed["external_id"] == "client-tx-api-001"
 
 
 @pytest.mark.asyncio
@@ -434,6 +616,61 @@ async def test_update_transaction(
     assert data["category"]["id"] == str(test_categories[0].id)
     assert data["payee_id"] == str(payee.id)
     assert data["payee_name"] == "Netflix"
+
+
+@pytest.mark.asyncio
+async def test_update_synced_transaction_rejects_amount_and_date_atomically(
+    client: AsyncClient,
+    auth_headers,
+    session: AsyncSession,
+    test_workspace,
+    test_user: User,
+    test_transactions: list[Transaction],
+):
+    synced = Transaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=test_transactions[0].account_id,
+        description="Provider description",
+        amount=Decimal("123.45"),
+        currency="BRL",
+        date=date(2025, 1, 15),
+        effective_date=date(2025, 2, 20),
+        type="debit",
+        source="sync",
+        amount_primary=Decimal("678.90"),
+        fx_rate_used=Decimal("5.5"),
+    )
+    session.add(synced)
+    await session.commit()
+
+    response = await client.patch(
+        f"/api/transactions/{synced.id}",
+        headers=auth_headers,
+        json={
+            "amount": "999.99",
+            "date": "2025-03-10",
+            "description": "Must not land",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Cannot change amount or date on a synchronized transaction"
+    )
+
+    response = await client.get(
+        f"/api/transactions/{synced.id}", headers=auth_headers
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert Decimal(str(body["amount"])) == Decimal("123.45")
+    assert body["date"] == "2025-01-15"
+    assert body["description"] == "Provider description"
+    assert Decimal(str(body["amount_primary"])) == Decimal("678.9")
+    assert Decimal(str(body["fx_rate_used"])) == Decimal("5.5")
+    await session.refresh(synced)
+    assert synced.effective_date == date(2025, 2, 20)
 
 
 @pytest.mark.asyncio
@@ -655,6 +892,91 @@ async def test_list_transactions_user_pnl_only(
 
 
 @pytest.mark.asyncio
+async def test_exclude_from_pnl_keeps_ledger_and_balance_but_not_report_totals(
+    client: AsyncClient, auth_headers,
+):
+    account_response = await client.post(
+        "/api/accounts",
+        headers=auth_headers,
+        json={
+            "name": "Report exclusion account",
+            "type": "checking",
+            "balance": 0,
+            "currency": "BRL",
+        },
+    )
+    assert account_response.status_code == 201, account_response.text
+    account_id = account_response.json()["id"]
+
+    transaction_response = await client.post(
+        "/api/transactions",
+        headers=auth_headers,
+        json={
+            "account_id": account_id,
+            "description": "Ledger-only income",
+            "amount": "100.00",
+            "date": date.today().isoformat(),
+            "type": "credit",
+        },
+    )
+    assert transaction_response.status_code == 201, transaction_response.text
+    transaction_id = transaction_response.json()["id"]
+
+    excluded = await client.patch(
+        f"/api/transactions/{transaction_id}",
+        headers=auth_headers,
+        json={"exclude_from_pnl": True},
+    )
+    assert excluded.status_code == 200, excluded.text
+    assert excluded.json()["exclude_from_pnl"] is True
+
+    ledger = await client.get(
+        f"/api/transactions?account_id={account_id}", headers=auth_headers
+    )
+    assert ledger.status_code == 200
+    assert ledger.json()["total"] == 1
+    assert ledger.json()["summary"]["income"] == pytest.approx(0)
+
+    accounts = await client.get("/api/accounts", headers=auth_headers)
+    assert accounts.status_code == 200
+    balance = next(row for row in accounts.json() if row["id"] == account_id)
+    assert balance["current_balance"] == pytest.approx(100)
+
+    pnl_only = await client.get(
+        f"/api/transactions?account_id={account_id}&user_pnl_only=true",
+        headers=auth_headers,
+    )
+    assert pnl_only.status_code == 200
+    assert pnl_only.json()["total"] == 0
+
+    cash_flow = await client.get(
+        "/api/reports/cash-flow",
+        headers=auth_headers,
+        params={"months": 1, "interval": "daily", "account_ids": account_id},
+    )
+    assert cash_flow.status_code == 200, cash_flow.text
+    today_flow = next(
+        row
+        for row in cash_flow.json()["trend"]
+        if row["date"] == date.today().isoformat()
+    )
+    assert today_flow["breakdowns"] == {"inflow": 0.0, "outflow": 0.0}
+
+    ignored = await client.patch(
+        f"/api/transactions/{transaction_id}",
+        headers=auth_headers,
+        json={"is_ignored": True},
+    )
+    assert ignored.status_code == 200, ignored.text
+    ignored_accounts = await client.get("/api/accounts", headers=auth_headers)
+    assert ignored_accounts.status_code == 200
+    ignored_balance = next(
+        row for row in ignored_accounts.json() if row["id"] == account_id
+    )
+    assert ignored_balance["current_balance"] == pytest.approx(0)
+
+
+@pytest.mark.asyncio
 async def test_exclude_transfers_false_includes_all(
     client: AsyncClient, auth_headers, test_transactions_with_transfers,
 ):
@@ -798,3 +1120,73 @@ async def test_list_transactions_summary_respects_filters(
     assert summary["income"] == pytest.approx(0.0)
     assert summary["expense"] == pytest.approx(25.5)
     assert summary["net"] == pytest.approx(-25.5)
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_includes_ignored_by_default(
+    client: AsyncClient, auth_headers, session: AsyncSession, test_transactions: list[Transaction],
+):
+    """The flag has to be asked for: an ignored row is still part of the ledger."""
+    test_transactions[0].is_ignored = True
+    await session.commit()
+
+    response = await client.get("/api/transactions", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == len(test_transactions)
+    assert test_transactions[0].description in [item["description"] for item in data["items"]]
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_exclude_ignored(
+    client: AsyncClient, auth_headers, session: AsyncSession, test_transactions: list[Transaction],
+):
+    test_transactions[0].is_ignored = True
+    await session.commit()
+
+    response = await client.get("/api/transactions?exclude_ignored=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    data = response.json()
+    descriptions = [item["description"] for item in data["items"]]
+    assert test_transactions[0].description not in descriptions
+    # `total` drives the pager, so it has to shrink with the rows.
+    assert data["total"] == len(test_transactions) - 1
+
+
+@pytest.mark.asyncio
+async def test_list_transactions_exclude_ignored_drops_rows_in_an_ignored_category(
+    client: AsyncClient,
+    auth_headers,
+    session: AsyncSession,
+    test_transactions: list[Transaction],
+    test_categories: list[Category],
+):
+    """The list badges a row as ignored when its category is, so hiding must
+    follow the badge rather than the column."""
+    test_categories[0].is_ignored = True
+    await session.commit()
+
+    in_ignored_category = [t.description for t in test_transactions if t.category_id == test_categories[0].id]
+    assert in_ignored_category, "fixture no longer has a transaction in this category"
+
+    response = await client.get("/api/transactions?exclude_ignored=true", headers=auth_headers)
+
+    descriptions = [item["description"] for item in response.json()["items"]]
+    for description in in_ignored_category:
+        assert description not in descriptions
+
+
+@pytest.mark.asyncio
+async def test_export_transactions_exclude_ignored(
+    client: AsyncClient, auth_headers, session: AsyncSession, test_transactions: list[Transaction],
+):
+    """The CSV is the list you are looking at, so it takes the same filter."""
+    test_transactions[0].is_ignored = True
+    await session.commit()
+
+    response = await client.get("/api/transactions/export?exclude_ignored=true", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert test_transactions[0].description not in response.text

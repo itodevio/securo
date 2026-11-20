@@ -1,5 +1,5 @@
 import uuid
-from datetime import date
+from datetime import date as _date
 from decimal import Decimal
 from typing import Optional
 
@@ -25,8 +25,12 @@ class AssetValue(Base):
     # entering past buys/sells correctly reshapes the whole history (issue:
     # backdated trades didn't update the baked `amount`). Null for manual/growth
     # assets, where `amount` is the value directly.
+    # The price is stored as quoted that day and never adjusted for a later split: a
+    # split is a ledger entry that changes the quantity from its date on, so
+    # quantity(date) × price(date) only adds up while these prices stay unadjusted.
+    # Backfilling history from a split-adjusted series would break that.
     price: Mapped[Optional[Decimal]] = mapped_column(Numeric(precision=18, scale=6), nullable=True)
-    date: Mapped[date] = mapped_column(Date)
+    date: Mapped[_date] = mapped_column(Date)
     source: Mapped[str] = mapped_column(String(20), default="manual")  # manual, rule, sync
 
     asset: Mapped["Asset"] = relationship(back_populates="values")

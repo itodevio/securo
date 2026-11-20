@@ -81,7 +81,7 @@ export function ConversationRow({ conv, agentId, active, onPick, onDeleted }: Pr
               setEditing(false)
             }
           }}
-          className="flex-1 min-w-0 rounded-sm border bg-background px-1.5 py-0.5 text-sm"
+          className="flex-1 min-w-0 rounded-sm border bg-card px-1.5 py-0.5 text-sm"
         />
         <button
           type="button"
@@ -116,7 +116,7 @@ export function ConversationRow({ conv, agentId, active, onPick, onDeleted }: Pr
       <button
         type="button"
         onClick={onPick}
-        className="flex-1 min-w-0 flex items-center gap-2 text-left"
+        className="flex-1 min-w-0 flex items-center gap-2 text-start"
       >
         <MessageSquare className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         <span className="flex-1 min-w-0 truncate">{conv.title || t('agents.detail.untitled')}</span>

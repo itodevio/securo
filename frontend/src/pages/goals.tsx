@@ -1,5 +1,5 @@
-import { createElement, useState } from 'react'
-import { getAccountName } from '@/lib/account-utils'
+import { useState } from 'react'
+import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale } from '@/hooks/use-display-locale'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -23,23 +23,16 @@ import {
 } from '@/components/ui/popover'
 import type { Account, Asset, AssetGroup, Goal } from '@/types'
 import {
-  Pencil, Trash2, Plus, Pause, Play, CheckCircle2, Archive, ArchiveRestore, Target,
+  Pencil, Trash2, Plus, Pause, Play, CheckCircle2, Archive, ArchiveRestore,
   ChevronDown,
 } from 'lucide-react'
-import { ICON_MAP } from '@/lib/category-icons'
+import { CategoryIcon } from '@/components/category-icon'
 import { IconPicker } from '@/components/icon-picker'
 import { PageHeader } from '@/components/page-header'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { useAuth } from '@/contexts/auth-context'
 import { useWorkspace } from '@/contexts/workspace-context'
-
-function formatCurrency(value: number, currency = 'USD', locale = 'en-US') {
-  return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(value)
-}
-
-function getGoalIcon(iconKey: string | null) {
-  return (iconKey && ICON_MAP[iconKey]) || Target
-}
+import { formatCurrency } from '@/lib/format'
 
 const PRESET_COLORS = [
   '#3B82F6', '#10B981', '#F59E0B', '#EF4444',
@@ -284,17 +277,11 @@ export default function GoalsPage() {
                     ? 'bg-amber-400'
                     : 'bg-muted-foreground/30'
 
-              const GoalIcon = getGoalIcon(goal.icon)
               return (
                 <div key={goal.id} className="px-4 sm:px-5 py-4 hover:bg-muted/50 transition-colors">
                   <div className="flex items-start gap-4">
                     {/* Icon */}
-                    <div
-                      className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 text-white"
-                      style={{ backgroundColor: goal.color ?? '#6B7280' }}
-                    >
-                      <GoalIcon size={18} />
-                    </div>
+                    <CategoryIcon icon={goal.icon} color={goal.color} size="lg" />
 
                     {/* Content */}
                     <div className="flex-1 min-w-0">
@@ -543,7 +530,7 @@ export default function GoalsPage() {
                 label={t('goals.account')}
                 placeholder={t('goals.selectAccount')}
                 defaultValue={editing?.account_id}
-                items={accountsList}
+                items={sortAccountsByDisplayName(accountsList ?? [])}
                 renderOption={(acc) => `${getAccountName(acc)} (${acc.currency})`}
               />
             )}
@@ -578,14 +565,9 @@ export default function GoalsPage() {
                 <PopoverTrigger asChild>
                   <button
                     type="button"
-                    className="w-full flex items-center gap-3 border border-border rounded-lg px-3 py-2 text-sm bg-card hover:bg-muted/50 transition-colors text-left"
+                    className="w-full flex items-center gap-3 border border-border rounded-lg px-3 py-2 text-sm bg-card hover:bg-muted/50 transition-colors text-start"
                   >
-                    <div
-                      className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0 text-white"
-                      style={{ backgroundColor: selectedColor }}
-                    >
-                      {createElement(getGoalIcon(selectedIcon), { size: 18 })}
-                    </div>
+                    <CategoryIcon icon={selectedIcon} color={selectedColor} size="lg" />
                     <span className="flex-1 text-muted-foreground">{t('goals.chooseIconColor')}</span>
                     <ChevronDown size={14} className="text-muted-foreground" />
                   </button>
@@ -597,6 +579,8 @@ export default function GoalsPage() {
                       <button
                         key={c}
                         type="button"
+                        aria-label={c}
+                        title={c}
                         onClick={() => setSelectedColor(c)}
                         className={`w-7 h-7 rounded-full transition-all ${
                           selectedColor === c ? 'ring-2 ring-offset-1 ring-primary scale-110' : 'hover:scale-110'

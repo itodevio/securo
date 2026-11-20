@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
 
@@ -30,7 +32,7 @@ def normalize_openai_base_url(url: str) -> str:
     Rules:
       - empty → returned as-is
       - trailing slashes stripped
-      - if any path segment looks like a version (`v1`, `v2`, `beta`,
+      - if any path segment looks like a version (`v1`, `v2`, `v1beta`, `beta`,
         `latest`, `api/v3`, etc.), leave the URL alone
       - otherwise, append `/v1`
     """
@@ -40,7 +42,7 @@ def normalize_openai_base_url(url: str) -> str:
     path_segments = [s for s in (urlparse(url).path or "").split("/") if s]
     for seg in path_segments:
         if (
-            (seg.startswith("v") and seg[1:].isdigit())
+            re.fullmatch(r"v\d+(?:(?:alpha|beta)\d*)?", seg)
             or seg in {"beta", "latest"}
         ):
             return url
@@ -59,6 +61,8 @@ def _serialize_messages(messages: list[ChatMessage]) -> list[dict]:
                     "id": tc.id,
                     "type": "function",
                     "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                    **({"extra_content": {"google": {"thought_signature": tc.thought_signature}}}
+                       if tc.thought_signature is not None else {}),
                 }
                 for tc in m.tool_calls
             ]
@@ -92,6 +96,40 @@ def _raise_for_status(status: int, body: str) -> None:
         raise LLMUnavailableError(f"OpenAI {status}: {body}", status=status)
 
 
+def _app_user_agent() -> str:
+    """Client identity for model backends.
+
+    Backends see the HTTP library name by default (e.g. `python-httpx/0.x`);
+    a few of them ask for the real client instead. Identifying as
+    `securo/<version>` keeps the logs on their side meaningful.
+    """
+    try:
+        return f"securo/{_pkg_version('securo-backend')}"
+    except PackageNotFoundError:
+        return "securo"
+
+
+_APP_USER_AGENT = _app_user_agent()
+
+
+def _tool_call_key(
+    tc: dict, last_key: Optional[tuple[str, object]]
+) -> tuple[str, object]:
+    """Which streamed tool call a delta belongs to.
+
+    OpenAI keys every delta by `index`; only the first one of a call carries
+    `id` and `name`, so `index` wins when present. Gemini's OpenAI endpoint
+    leaves `index` out: there a new `id` opens a new call, and a delta with
+    neither continues the call before it. Defaulting a missing index to 0
+    glued parallel calls into one (`{"months":12}{}`).
+    """
+    if tc.get("index") is not None:
+        return ("index", int(tc["index"]))
+    if tc.get("id"):
+        return ("id", tc["id"])
+    return last_key or ("index", 0)
+
+
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
@@ -107,6 +145,11 @@ class OpenAIProvider(LLMProvider):
         h = {"Content-Type": "application/json"}
         if self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
+        # Identify the client to model backends; a few OpenAI-compatible
+        # endpoints also route on a per-conversation session id.
+        h["User-Agent"] = _APP_USER_AGENT
+        if self.session_id:
+            h["x-opencode-session"] = self.session_id
         return h
 
     async def chat_stream(
@@ -128,8 +171,16 @@ class OpenAIProvider(LLMProvider):
         }
         if tools:
             payload["tools"] = _serialize_tools(tools)
+        supports_tools_without_reasoning = (
+            urlparse(self.base_url).hostname == "api.openai.com"
+            and model in {"gpt-6-luna", "gpt-6-sol"}
+        )
+        if supports_tools_without_reasoning:
+            # Chat Completions supports function calls for these models only with reasoning disabled.
+            payload["reasoning_effort"] = "none"
         if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+            limit_key = "max_completion_tokens" if supports_tools_without_reasoning else "max_tokens"
+            payload[limit_key] = max_tokens
 
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
@@ -137,15 +188,12 @@ class OpenAIProvider(LLMProvider):
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode("utf-8", errors="replace")
                         _raise_for_status(resp.status_code, body)
-                    # OpenAI's streaming protocol uses `index` (an integer)
-                    # as the stable key for tool calls across chunks. The
-                    # first chunk for an index carries `id` and `name`;
-                    # subsequent chunks only carry `arguments` deltas.
-                    # We MUST key by index, not by id — otherwise later
-                    # chunks (without id) get registered as new entries
-                    # with empty names and the dispatcher fails with
-                    # "unknown tool: ".
-                    idx_state: dict[int, dict] = {}
+                    # Tool calls are collected over the whole stream and
+                    # emitted once it ends: a server may split the name
+                    # across chunks, so it is only complete at the end.
+                    # See `_tool_call_key` for how chunks find their call.
+                    calls: dict[tuple[str, object], dict] = {}
+                    last_key: Optional[tuple[str, object]] = None
                     finish_reason: Optional[str] = None
                     usage: Optional[Usage] = None
                     async for raw in resp.aiter_lines():
@@ -166,53 +214,44 @@ class OpenAIProvider(LLMProvider):
                             if delta.get("content"):
                                 yield ChatChunk(type="text_delta", text=delta["content"])
                             for tc in delta.get("tool_calls") or []:
-                                idx = int(tc.get("index", 0))
+                                last_key = _tool_call_key(tc, last_key)
                                 fn = tc.get("function") or {}
-                                state = idx_state.setdefault(idx, {
+                                state = calls.setdefault(last_key, {
                                     "id": None,
                                     "name": "",
-                                    "started": False,
-                                    "pending_args": "",
+                                    "args": "",
                                 })
-                                # First chunk usually carries both id and name;
-                                # some servers split the name across chunks.
+                                # Gemini's OpenAI endpoint puts the opaque signature
+                                # beside function, potentially in a later delta.
+                                extra = tc.get("extra_content")
+                                google = extra.get("google") if isinstance(extra, dict) else None
+                                signature = google.get("thought_signature") if isinstance(google, dict) else None
+                                if isinstance(signature, str):
+                                    state["thought_signature"] = signature
                                 if tc.get("id") and not state["id"]:
                                     state["id"] = tc["id"]
                                 if fn.get("name"):
                                     state["name"] += fn["name"]
-                                # Emit start exactly once, when we have enough
-                                # info to dispatch (name is the must-have).
-                                if not state["started"] and state["name"]:
-                                    if not state["id"]:
-                                        state["id"] = f"_idx_{idx}"
-                                    state["started"] = True
-                                    yield ChatChunk(
-                                        type="tool_call_start",
-                                        tool_call_id=state["id"],
-                                        tool_name=state["name"],
-                                    )
-                                    if state["pending_args"]:
-                                        yield ChatChunk(
-                                            type="tool_call_args_delta",
-                                            tool_call_id=state["id"],
-                                            args_delta=state["pending_args"],
-                                        )
-                                        state["pending_args"] = ""
                                 if fn.get("arguments"):
-                                    if state["started"]:
-                                        yield ChatChunk(
-                                            type="tool_call_args_delta",
-                                            tool_call_id=state["id"],
-                                            args_delta=fn["arguments"],
-                                        )
-                                    else:
-                                        # Args arrived before name (rare).
-                                        state["pending_args"] += fn["arguments"]
+                                    state["args"] += fn["arguments"]
                             if choice.get("finish_reason"):
                                 finish_reason = choice["finish_reason"]
-                    for state in idx_state.values():
-                        if state["started"]:
-                            yield ChatChunk(type="tool_call_end", tool_call_id=state["id"])
+                    for position, state in enumerate(calls.values()):
+                        # A call with no name cannot be dispatched.
+                        if not state["name"]:
+                            continue
+                        call_id = state["id"] or f"_call_{position}"
+                        yield ChatChunk(
+                            type="tool_call_start", tool_call_id=call_id, tool_name=state["name"],
+                        )
+                        if state["args"]:
+                            yield ChatChunk(
+                                type="tool_call_args_delta", tool_call_id=call_id, args_delta=state["args"],
+                            )
+                        yield ChatChunk(
+                            type="tool_call_end", tool_call_id=call_id,
+                            thought_signature=state.get("thought_signature"),
+                        )
                     if usage:
                         yield ChatChunk(type="usage", usage=usage)
                     yield ChatChunk(type="finish", finish_reason=finish_reason or "stop")

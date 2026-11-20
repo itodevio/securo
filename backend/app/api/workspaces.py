@@ -1,9 +1,9 @@
 """Workspace + member management endpoints.
 
-Note: there's intentionally NO `POST /api/workspaces` endpoint here.
-Workspaces are auto-created at user registration; additional workspaces
-(Freelancer / Small Business / Accountant Firm) ship as part of the
-templates feature in a later phase.
+Every user gets a Personal workspace at registration. `POST` here
+creates the additional ones and is the only place `kind` is ever set;
+`PATCH` edits the rest of the workspace and deliberately cannot touch
+it.
 """
 import uuid
 
@@ -12,7 +12,9 @@ from fastapi_users import schemas as fu_schemas
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.app_clock import is_valid_timezone
 from app.core.auth import current_active_user, get_user_manager, UserManager
+from app.core.auth_policy import local_auth_enabled, require_local_auth_enabled
 from app.core.database import get_async_session
 from app.core.workspace_context import WorkspaceContext, current_workspace
 from app.models.user import User
@@ -25,14 +27,26 @@ from app.schemas.workspace import (
     WorkspaceRead,
     WorkspaceUpdate,
 )
-from app.services import workspace_service
+from app.services import module_service, workspace_service
+from app.services.primary_restamp_service import (
+    fetch_missing_today_rates,
+    restamp_user_primary_amounts,
+)
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspaces"])
 
 
-def _user_display_name(user: User) -> str | None:
-    prefs = user.preferences or {}
-    return prefs.get("display_name") or None
+def _workspace_read(workspace: Workspace, role: str | None) -> WorkspaceRead:
+    """Build the read model for a workspace.
+
+    Every response that returns a workspace goes through here, so a new
+    read path cannot ship without `enabled_modules` — forgetting it
+    would leave the frontend hiding modules the server enabled.
+    """
+    item = WorkspaceRead.model_validate(workspace)
+    item.role = role
+    item.enabled_modules = module_service.resolve_modules(workspace)
+    return item
 
 
 @router.get("", response_model=list[WorkspaceRead])
@@ -64,9 +78,7 @@ async def list_my_workspaces(
     out: list[WorkspaceRead] = []
     seen_ids: set[uuid.UUID] = set()
     for ws, role in member_rows.all():
-        item = WorkspaceRead.model_validate(ws)
-        item.role = role
-        out.append(item)
+        out.append(_workspace_read(ws, role))
         seen_ids.add(ws.id)
 
     managed_rows = await session.execute(
@@ -80,9 +92,7 @@ async def list_my_workspaces(
     for ws in managed_rows.scalars().all():
         if ws.id in seen_ids:
             continue
-        item = WorkspaceRead.model_validate(ws)
-        item.role = "manager"
-        out.append(item)
+        out.append(_workspace_read(ws, "manager"))
     return out
 
 
@@ -105,22 +115,19 @@ async def create_workspace_endpoint(
         kind=body.kind,
         default_currency=body.default_currency,
         locale=body.locale,
+        tax_jurisdiction=body.tax_jurisdiction,
         icon=body.icon,
         color=body.color,
         self_membership=body.self_membership,
     )
     await session.commit()
-    item = WorkspaceRead.model_validate(workspace)
-    item.role = "owner" if body.self_membership else "manager"
-    return item
+    return _workspace_read(workspace, "owner" if body.self_membership else "manager")
 
 
 @router.get("/current", response_model=WorkspaceRead)
 async def get_current_workspace(ctx: WorkspaceContext = Depends(current_workspace)):
     """Return the workspace resolved from X-Workspace-Id (or the default)."""
-    item = WorkspaceRead.model_validate(ctx.workspace)
-    item.role = ctx.role
-    return item
+    return _workspace_read(ctx.workspace, ctx.role)
 
 
 @router.patch("/{workspace_id}", response_model=WorkspaceRead)
@@ -137,23 +144,31 @@ async def update_workspace(
     if workspace is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     updates = body.model_dump(exclude_unset=True)
+    timezone = updates.get("timezone")
+    if timezone is not None and not is_valid_timezone(timezone):
+        raise HTTPException(status_code=400, detail="Invalid IANA timezone")
+    new_currency = updates.get("default_currency")
+    restamp = bool(new_currency) and (user.preferences or {}).get("currency_display") != new_currency
+    if restamp:
+        # Commits on its own, so it runs before any change below.
+        await fetch_missing_today_rates(session, user.id, new_currency)
     for key, value in updates.items():
         setattr(workspace, key, value)
     # Changing the workspace currency follows through to the acting
     # owner's display currency, so the whole app re-renders in the new
     # currency (display is driven by user.currency_display, not the
     # workspace). Other members keep their own currency_display override.
-    new_currency = updates.get("default_currency")
-    if new_currency and (user.preferences or {}).get("currency_display") != new_currency:
+    if restamp:
         prefs = dict(user.preferences or {})
         prefs["currency_display"] = new_currency
         user.preferences = prefs
         session.add(user)
+        # The owner's stored primary amounts follow, or their totals would
+        # keep the old currency's numbers under the new symbol (#1381).
+        await restamp_user_primary_amounts(session, user.id)
     await session.commit()
     await session.refresh(workspace)
-    item = WorkspaceRead.model_validate(workspace)
-    item.role = member.role
-    return item
+    return _workspace_read(workspace, member.role)
 
 
 @router.get("/{workspace_id}/members", response_model=list[MemberRead])
@@ -170,7 +185,7 @@ async def list_workspace_members(
             id=m.id,
             user_id=u.id,
             email=u.email,
-            display_name=_user_display_name(u),
+            display_name=u.display_name,
             role=m.role,
             joined_at=m.joined_at,
         )
@@ -202,8 +217,21 @@ async def invite_member(
     target = existing.scalar_one_or_none()
 
     if target is None:
-        # Brand-new user — only allowed if a password was provided.
-        if not body.password:
+        # Brand-new user — creating the account here mints a local password,
+        # so it is only allowed while local credentials are accepted.
+        if body.password:
+            require_local_auth_enabled()
+        elif not local_auth_enabled():
+            # There is no password to ask for in OIDC-only mode, so point at
+            # what actually unblocks the invite.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "User not found. They must sign in through the identity "
+                    "provider once before they can be added."
+                ),
+            )
+        else:
             raise HTTPException(
                 status_code=400,
                 detail="User not found. Provide a password to create them.",
@@ -247,7 +275,7 @@ async def invite_member(
         id=member.id,
         user_id=target.id,
         email=target.email,
-        display_name=_user_display_name(target),
+        display_name=target.display_name,
         role=member.role,
         joined_at=member.joined_at,
     )
@@ -271,12 +299,16 @@ async def change_member_role(
         session, workspace_id, member_user_id, body.role
     )
     await session.commit()
+
     target = await session.get(User, member_user_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Could not find user")
+
     return MemberRead(
         id=member.id,
         user_id=target.id,
         email=target.email,
-        display_name=_user_display_name(target),
+        display_name=target.display_name,
         role=member.role,
         joined_at=member.joined_at,
     )
@@ -306,9 +338,7 @@ async def archive_workspace_endpoint(
     )
     workspace = await workspace_service.archive_workspace(session, workspace_id, user.id)
     await session.commit()
-    item = WorkspaceRead.model_validate(workspace)
-    item.role = "owner"
-    return item
+    return _workspace_read(workspace, "owner")
 
 
 @router.delete(

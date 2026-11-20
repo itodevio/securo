@@ -3,13 +3,17 @@
 </p>
 <h1 align="center">Securo</h1>
 <p align="center">
-  <a href="https://github.com/securo-finance/securo/actions/workflows/ci.yml"><img src="https://github.com/securo-finance/securo/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://www.buymeacoffee.com/usesecuro"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support%20Securo-FFDD00?logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee" /></a>
+  <br />
+  <a href="https://github.com/securo-finance/securo/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/securo-finance/securo/actions/workflows/ci.yml/badge.svg?branch=main&amp;event=push" alt="CI" /></a>
   <img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/tassionoronha/ae627b744aaa2ba89d850ea541c311be/raw/coverage.json" alt="Coverage" />
   <a href="https://github.com/securo-finance/securo/pkgs/container/securo-frontend"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/tassionoronha/ae627b744aaa2ba89d850ea541c311be/raw/downloads.json" alt="Downloads" /></a>
+  <br />
+  <a href="https://artifacthub.io/packages/search?repo=securo"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/securo" alt="Artifact Hub" /></a>
   <a href="https://www.gnu.org/licenses/agpl-3.0"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0" /></a>
   <a href="https://discord.gg/rUqTKtQ9S4"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join our Discord" /></a>
   <br />
-  <a href="https://usesecuro.com/">Website</a> · <a href="https://demo.usesecuro.com/">Try our Demo</a> · <a href="https://docs.usesecuro.com/">Read the Docs</a> · <a href="https://discord.gg/rUqTKtQ9S4">Discord</a>
+  <a href="https://usesecuro.com/">Website</a> · <a href="https://demo.usesecuro.com/">Demo</a> · <a href="https://www.usesecuro.com/roadmap">Roadmap</a> · <a href="https://docs.usesecuro.com/">Docs</a> · <a href="https://discord.gg/rUqTKtQ9S4">Discord</a> · <a href="https://cal.com/tassio/15min">Talk to the maintainer</a>
 </p>
 
 <h3 align="center">Finance apps want your data. This one doesn't.</h3>
@@ -45,182 +49,64 @@ Open [http://localhost:3000](http://localhost:3000) and create an account. That'
 - Transaction management with search, filters, and CSV export
 - File import (OFX, QIF, CAMT, CSV)
 - Auto-categorization rules engine
-- Recurring transactions and budgets
+- Recurring transactions, budgets, and loan/financing tracking
 - Goals and savings targets with progress tracking
 - Asset management with valuation tracking and growth rules
 - Reports: Net Worth and Income vs Expenses with category sparklines
-- Bank sync via providers (Pluggy for Brazilian banks, Enable Banking for ~2500 European PSD2 banks, SimpleFIN for US and international banks, extensible)
 - Multi-currency support with automatic FX conversion
-- Multi-user support with admin panel and registration controls
-- Two-factor authentication (TOTP) with brute-force protection
-- OIDC login support for Authentik, Pocket ID, and other standard providers
-- AI Agents (optional): self-hosted LLM chat with tool-use over your data, plus a per-agent RAG knowledge base
+- Multi-user support with workspaces, roles, and an admin panel
+- Passkeys, two-factor authentication (TOTP), and OIDC single sign-on
+- Bank sync via providers (Pluggy, Enable Banking, SimpleFIN, extensible)
+- AI Agents (optional): self-hosted LLM chat with tool-use over your data
 
-## Bank Sync (Optional)
+### Reporting dates and bank balances
 
-Add credentials for any of the supported providers to `.env`, then restart with `docker compose up`. Configure one or both — each provider auto-registers when its credentials are present.
+Synchronized transactions can have a reporting-date override without changing
+the bank's booking date. Clear the override to restore automatic attribution;
+later bank syncs preserve the override.
 
-### Pluggy — Brazilian banks
+Reporting periods and transaction-list dates follow the override. Account
+running balances and posted cash-flow balance movements still follow the bank
+date (or the effective movement date in accrual mode). A posted expense
+attributed to a future period appears in that period's cash-flow outflow, but
+is not deducted from the projected balance a second time. Pending card rows
+retain their manually selected bill date for forecast outflow and projected
+balance timing, including in cash mode.
 
-Sign up at [pluggy.ai](https://pluggy.ai) and add:
+The calendar offers separate reporting-date and bank-date views. Moved rows
+retain their original bank date in the transaction list.
 
-```
-PLUGGY_CLIENT_ID=your-client-id
-PLUGGY_CLIENT_SECRET=your-client-secret
-```
+## Optional capabilities
 
-### Enable Banking — European banks (PSD2)
+Everything beyond the core is off by default, needs a single env flag, and costs nothing until you turn it on. Full setup guides live in the [documentation](https://docs.usesecuro.com/):
 
-Sign up at [enablebanking.com](https://enablebanking.com), create a Production application, and download its PEM private key. Save the PEM to `./secrets/` (gitignored), then add:
-
-```
-ENABLE_BANKING_APP_ID=your-application-id
-ENABLE_BANKING_PRIVATE_KEY_FILE=/app/secrets/your-key.pem
-ENABLE_BANKING_OAUTH_REDIRECT_URI=https://your-host/oauth/callback
-```
-
-The redirect URI must match exactly one of the Allowed Redirect URLs in your EB application. Production EB requires HTTPS — for local development, expose your frontend via a tunnel (ngrok, cloudflared) or use the EB sandbox.
-
-> **Free tier — restricted mode.** Enable Banking's free plan requires you to pre-link the accounts you want to import inside the EB portal *before* connecting from Securo. If you skip that step, the connection returns no accounts and Securo will surface a banner with a link to the portal.
-
-### SimpleFIN — US and international banks
-
-[SimpleFIN](https://www.simplefin.org/) is a read-only open protocol. No API key needed — each connection brings its own credentials via a single-use Setup Token from the [SimpleFIN Bridge](https://bridge.simplefin.org/). Just enable the feature:
-
-```
-SIMPLEFIN_ENABLED=true
-SIMPLEFIN_API_URL=https://beta-bridge.simplefin.org   # sandbox; use bridge.simplefin.org for real banks
-```
-
-Then in Securo: **Accounts → Connect Bank → SimpleFIN**, and paste the token. The [developer page](https://beta-bridge.simplefin.org/info/developers) gives out free demo tokens if you want to try it without a real bank.
-
-## OIDC Login (Optional)
-
-Securo can delegate login to any standard OIDC provider, including Authentik and Pocket ID. Create a confidential/web application in your provider and register this redirect URI:
-
-```
-https://your-securo-host/api/auth/oidc/callback
-```
-
-Then add the provider settings to `.env` and restart:
-
-```
-OIDC_ENABLED=true
-OIDC_PROVIDER_NAME=Pocket ID
-OIDC_DISCOVERY_URL=https://id.example.com/.well-known/openid-configuration
-OIDC_CLIENT_ID=securo
-OIDC_CLIENT_SECRET=your-client-secret
-# Optional; defaults to ${FRONTEND_URL}/api/auth/oidc/callback
-OIDC_REDIRECT_URI=https://your-securo-host/api/auth/oidc/callback
-```
-
-New OIDC users are auto-provisioned by default (`OIDC_AUTO_REGISTER=true`) using verified email addresses. Set `OIDC_AUTO_REGISTER=false` to allow only existing Securo users whose email matches the provider claim.
-
-### Optional OIDC role sync
-
-Securo can also synchronize provider roles/groups into its built-in permissions when `OIDC_SYNC_ROLES=true`. The default claim is `groups`, which works well with Authentik group mappings and Pocket ID role/group assignments.
-
-```
-OIDC_SYNC_ROLES=true
-OIDC_ROLES_CLAIM=groups
-OIDC_ADMIN_ROLES=securo-admins
-OIDC_WORKSPACE_ROLE_MAP={"securo-owners":"owner","securo-editors":"editor","securo-viewers":"viewer"}
-```
-
-`OIDC_ADMIN_ROLES` grants or revokes Securo admin (`is_superuser`) on each OIDC login. `OIDC_WORKSPACE_ROLE_MAP` maps provider roles/groups to the user's Personal workspace role (`owner`, `editor`, or `viewer`); if multiple mapped roles are present, Securo applies the highest permission. Leave `OIDC_SYNC_ROLES=false` to keep all Securo roles managed locally.
-
-## Passkeys (Optional)
-
-Sign in with Touch ID, Face ID, Windows Hello, or a security key. Passkeys are on by default and need no configuration: they follow whatever address you open Securo on.
-
-Two rules come from the WebAuthn standard itself, and no setting can work around them:
-
-- **An IP address is never valid.** `http://192.168.1.10:3000` cannot register passkeys.
-- **Plain HTTP is never valid, except on `localhost`.**
-
-So use passkeys on `http://localhost:3000`, or put Securo on a domain behind an HTTPS reverse proxy. When serving from a domain, point `FRONTEND_URL` at it (this also covers CORS and OAuth callbacks):
-
-```
-FRONTEND_URL=https://securo.example.com
-```
-
-To pin passkeys to one domain, set `WEBAUTHN_RP_ID` (use the parent domain if you reach Securo on several subdomains). Otherwise Securo follows the browser, and requests from an unusable address get an explanation in the UI instead of a silent failure.
-
-## Exchange Rates (Optional)
-
-For automatic currency conversion, add a free [Open Exchange Rates](https://openexchangerates.org/) key to `.env`:
-
-```
-OPENEXCHANGERATES_APP_ID=your-app-id
-```
-
-Rates are fetched on-demand when foreign-currency transactions are created. Without a key, cross-currency amounts default to a 1:1 fallback rate with a visual warning.
-
-## AI Agents (Optional)
-
-Self-hosted AI assistants over your Securo data — multi-provider (OpenAI, Anthropic, Ollama, OpenAI-compatible), tool-use via MCP, per-agent RAG knowledge base, ⌘J global chat panel.
-
-Add to `.env`:
-
-```
-AGENTS_ENABLED=true
-COMPOSE_PROFILES=agents
-```
-
-Then `docker compose up -d`. Settings → AI Agents to add a provider connection. Off by default; zero cost when off.
-
-## Tech Stack
-
-| Layer | Stack |
-|-------|-------|
-| Backend | FastAPI, SQLAlchemy, Alembic, Celery |
-| Frontend | React, TypeScript, Vite, Tailwind CSS |
-| Database | PostgreSQL |
-| Queue | Redis + Celery |
+- **Bank sync**: Pluggy for Brazilian banks, Enable Banking for ~2500 European PSD2 banks, and SimpleFIN for US and international banks. [Setup guides](https://docs.usesecuro.com/docs/features/bank-sync/) Administrators can also set the credentials in the app, under **Admin Settings → Bank connections**, without a restart ([provider settings](docs/provider-settings.md)).
+- **Login & security**: passkeys (Touch ID, Face ID, security keys), TOTP two-factor, and OIDC single sign-on with account linking and provider role sync. Signing out also ends the provider's session (RP-initiated logout, using its `end_session_endpoint` or `OIDC_LOGOUT_URL`). [Guide](https://docs.usesecuro.com/docs/features/security/)
+- **Exchange rates**: a free [Open Exchange Rates](https://openexchangerates.org/) key, set in `.env` or under **Admin Settings → Exchange rates**, enables automatic currency conversion; without one, cross-currency amounts fall back to 1:1 with a visual warning. [Details](https://docs.usesecuro.com/docs/deployment/docker/)
+- **Timezone**: balances, budgets, and due dates turn over at midnight in your application timezone, set once in Admin Settings, with per-workspace overrides. [Details](https://docs.usesecuro.com/docs/features/workspaces/)
+- **Attachment storage**: attachments and invoice logos stay on local disk by default; set `STORAGE_PROVIDER=s3` to keep them in a private S3-compatible bucket instead. [Guide](https://docs.usesecuro.com/docs/deployment/docker/#storing-attachments-in-s3)
+- **Plugins**: install community plugins into a workspace from the plugin catalog, with a preview before anything changes. A plugin's icon is served by Securo, which reads it from the catalog, so browsing never sends your browser anywhere else. Data plugins add categories and rules and need only `PLUGINS_ENABLED=true`. Plugins with code, such as sync from a service you use, also need the `plugins` Compose profile: they run in their own containers, without the core secrets or the database, and can reach only the hosts they declare.
+- **AI Agents**: self-hosted assistants over your data, multi-provider, with tool use and a per-agent knowledge base. [Guide](https://docs.usesecuro.com/docs/features/agents/)
 
 ## AI-Assisted Development
 
 Parts of this codebase were built with help of AI. All code is human-reviewed and no data leaves your environment.
 
-## Development
+Contributing with AI is welcome. We review the author, not the tool: whatever wrote the diff, you own its quality, its fit with where Securo is going, and everything that happens after it merges. See [Using AI](CONTRIBUTING.md#using-ai).
 
-```bash
-# Run backend tests (from backend/, needs Python 3.11+; same as CI)
-cd backend
-pip install -e ".[dev]"   # first time only — installs pytest and dev deps
-pytest
+## Support Securo
 
-# Rebuild after dependency changes
-docker compose up --build
-```
+Securo is free and open source, and it runs entirely on your own infrastructure. If it helps you, a coffee keeps development going:
 
-If you've [mise](https://mise.jdx.dev/) installed, you can install backend/frontend directly with it:
-
-```
-# Install the Python version specified in .python-version,
-# and create a project virtual environment using that Python.
-# Install all tools and dependencies (include Python with dedicated venv)
-mise //...:install
-
-# Install only backend tools/deps
-mise backend:install
-
-# Run backend tests
-mise backend:test
-
-# Install frontend dependencies
-mise frontend:install
-
-# Run frontend linting
-mise frontend:lint
-
-# Run frontend build
-mise frontend:build
-```
+<p align="center">
+  <a href="https://www.buymeacoffee.com/usesecuro"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" width="160" alt="Buy Me a Coffee" /></a>
+</p>
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and guidelines.
+
+Not sure where to start, or want to talk something through first? [Book 15 minutes](https://cal.com/tassio/15min) — no agenda needed. Something broken, an idea, or just what you think of Securo, all welcome.
 
 ## License
 

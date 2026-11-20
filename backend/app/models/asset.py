@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Index, Integer, Numeric, String, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -15,8 +15,35 @@ if TYPE_CHECKING:
     from app.models.asset_value import AssetValue
 
 
+
+# Asset types a loan can be secured against (a mortgage, a car financing).
+LOAN_COLLATERAL_TYPES = frozenset({"real_estate", "vehicle"})
+
+# Decimal precision of the asset price fields (last_price, average_price,
+# Numeric(18,6)). FX conversions of asset values keep this many decimals so a
+# sub-cent market price survives the conversion instead of rounding to 0.00
+# (issue #622). Monetary amounts keep two.
+ASSET_PRICE_DECIMALS = 6
+
+# external_metadata key for the date a sync provider says its reported value
+# is as of. The sync writes a fresh AssetValue every day, so a balance the
+# provider stopped moving still looks current; this date is what exposes it.
+PROVIDER_VALUE_DATE_METADATA_KEY = "_securo_provider_value_date"
+
+
 class Asset(Base):
     __tablename__ = "assets"
+    __table_args__ = (
+        Index(
+            "ux_assets_workspace_source_external",
+            "workspace_id",
+            "source",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
+            sqlite_where=text("external_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"))
@@ -48,7 +75,7 @@ class Asset(Base):
         UUID(as_uuid=True), ForeignKey("bank_connections.id", ondelete="SET NULL"), nullable=True
     )
     external_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
-    source: Mapped[str] = mapped_column(String(50), default="manual")
+    source: Mapped[str] = mapped_column(String(128), default="manual")
     isin: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     maturity_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     external_metadata: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)

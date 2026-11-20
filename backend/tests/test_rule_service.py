@@ -9,23 +9,35 @@ from app.models.account import Account
 from app.models.category import Category
 from app.models.payee import Payee
 from app.models.transaction import Transaction
-from app.schemas.rule import RuleAction, RuleCondition, RuleCreate, RuleExportItem, RuleExportPayload, RuleUpdate
+from app.schemas.rule import (
+    RuleAction,
+    RuleCondition,
+    RuleConditionGroup,
+    RuleCreate,
+    RuleExportItem,
+    RuleExportPayload,
+    RuleUpdate,
+)
+from app.schemas.transaction import TransactionUpdate
 from app.services.rule_service import (
     DuplicateRuleError,
-    RULE_PACKS,
     apply_all_rules,
     apply_rules_to_transaction,
+    apply_single_rule,
     create_default_rules,
     create_rule,
     delete_rule,
-    get_installed_packs,
+    export_rules,
     get_rule,
     get_rules,
     import_rules,
-    install_rule_pack,
+    preview_rule,
+    preview_rules_for_transaction,
     update_rule,
 )
+from app.services.transaction_service import update_transaction
 from app.services.category_service import create_default_categories
+from app.services.rule_packs import built_in_packs, install_rule_pack, list_rule_packs
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +210,7 @@ async def test_update_rule_duplicate_name_raises(session: AsyncSession, test_use
 
 @pytest.mark.asyncio
 async def test_create_rule_rejects_unknown_action(session: AsyncSession, test_user, test_workspace):
-    with pytest.raises(ValueError, match="Invalid rule action"):
+    with pytest.raises(ValueError, match="Invalid action: unsupported op 'explode'"):
         await create_rule(
             session,
             test_workspace.id,
@@ -207,6 +219,35 @@ async def test_create_rule_rejects_unknown_action(session: AsyncSession, test_us
                 name="Bad Action",
                 conditions=[RuleCondition(field="description", op="contains", value="X")],
                 actions=[RuleAction(op="explode", value="nope")],
+            ),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "op", "expected"),
+    [
+        (
+            "amount",
+            "less_than_or_equal",
+            "Invalid condition: unsupported op 'less_than_or_equal' for field 'amount'",
+        ),
+        ("amount", ">", "Invalid condition: unsupported op '>' for field 'amount'"),
+        ("foo", "equals", "Invalid condition: unsupported field 'foo'"),
+    ],
+)
+async def test_create_rule_names_the_rejected_condition(
+    session: AsyncSession, test_user, test_workspace, field, op, expected
+):
+    with pytest.raises(ValueError, match=expected):
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name="Bad condition",
+                conditions=[RuleCondition(field=field, op=op, value=0)],
+                actions=[RuleAction(op="ignore", value=True)],
             ),
         )
 
@@ -226,6 +267,124 @@ async def test_create_rule_rejects_category_outside_workspace(
                 actions=[RuleAction(op="set_category", value=str(uuid.uuid4()))],
             ),
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pattern", ["foo|", "a*", "^$"])
+async def test_create_rule_rejects_empty_matching_regex(
+    session: AsyncSession, test_user, test_workspace, pattern
+):
+    name = f"Unsafe regex {pattern}"
+    error = None
+    try:
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name=name,
+                conditions=[
+                    RuleCondition(field="description", op="regex", value=pattern)
+                ],
+                actions=[RuleAction(op="append_notes", value="#unsafe")],
+            ),
+        )
+    except ValueError as exc:
+        error = str(exc)
+
+    persisted = {rule.name for rule in await get_rules(session, test_workspace.id)}
+    assert (error, name in persisted) == (
+        "Regular expression must not match an empty string",
+        False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_rule_rejects_malformed_regex(
+    session: AsyncSession, test_user, test_workspace
+):
+    name = "Malformed regex"
+    error = None
+    try:
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name=name,
+                conditions=[RuleCondition(field="description", op="regex", value="[")],
+                actions=[RuleAction(op="append_notes", value="#malformed")],
+            ),
+        )
+    except ValueError as exc:
+        error = str(exc)
+
+    persisted = {rule.name for rule in await get_rules(session, test_workspace.id)}
+    assert (error, name in persisted) == ("Invalid regular expression", False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pattern",
+    ["foo|bar", "^NETFLIX", "PIX.*RECEBIDO", r"\bFOO\b", "foo.*", ".+", "^.+$"],
+)
+async def test_create_rule_accepts_safe_regex(
+    session: AsyncSession, test_user, test_workspace, pattern
+):
+    await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name=f"Safe regex {pattern}",
+            conditions=[RuleCondition(field="description", op="regex", value=pattern)],
+            actions=[RuleAction(op="append_notes", value="#safe")],
+        ),
+    )
+
+
+
+@pytest.mark.asyncio
+async def test_create_rule_rejects_empty_matching_regex_in_condition_group(
+    session: AsyncSession, test_user, test_workspace
+):
+    name = "Unsafe grouped regex"
+    error = None
+    try:
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name=name,
+                conditions_op="or",
+                conditions=[
+                    RuleCondition(
+                        field="description", op="contains", value="SAFE"
+                    ),
+                    RuleConditionGroup(
+                        op="or",
+                        conditions=[
+                            RuleCondition(
+                                field="description", op="regex", value="foo|"
+                            ),
+                            RuleCondition(
+                                field="description", op="contains", value="OTHER"
+                            ),
+                        ],
+                    ),
+                ],
+                actions=[RuleAction(op="append_notes", value="#grouped")],
+            ),
+        )
+    except ValueError as exc:
+        error = str(exc)
+
+    persisted = {rule.name for rule in await get_rules(session, test_workspace.id)}
+    assert (error, name in persisted) == (
+        "Regular expression must not match an empty string",
+        False,
+    )
 
 
 @pytest.mark.asyncio
@@ -298,6 +457,101 @@ async def test_import_rules_skips_invalid_rules(
     assert result.skipped == 2
 
 
+
+@pytest.mark.asyncio
+async def test_import_rules_skips_unsafe_and_malformed_regexes(
+    session: AsyncSession, test_user, test_workspace
+):
+    payload = RuleExportPayload(
+        rules=[
+            RuleExportItem(
+                name="Unsafe regex import",
+                conditions=[
+                    RuleCondition(field="description", op="regex", value="foo|")
+                ],
+                actions=[RuleAction(op="append_notes", value="#unsafe")],
+            ),
+            RuleExportItem(
+                name="Malformed regex import",
+                conditions=[RuleCondition(field="description", op="regex", value="[")],
+                actions=[RuleAction(op="append_notes", value="#malformed")],
+            ),
+            RuleExportItem(
+                name="Safe regex import",
+                conditions=[
+                    RuleCondition(field="description", op="regex", value="foo|bar")
+                ],
+                actions=[RuleAction(op="append_notes", value="#safe")],
+            ),
+        ]
+    )
+
+    result = await import_rules(
+        session, test_workspace.id, test_user.id, payload, overwrite=True
+    )
+    persisted = {
+        rule.name: rule.conditions[0]["value"]
+        for rule in await get_rules(session, test_workspace.id)
+    }
+
+    assert (
+        result.imported,
+        result.skipped,
+        persisted,
+    ) == (
+        1,
+        2,
+        {"Safe regex import": "foo|bar"},
+    )
+
+@pytest.mark.asyncio
+async def test_set_description_validation_and_export_compatibility(
+    session: AsyncSession, test_user, test_workspace
+):
+    condition = RuleCondition(field="payee", op="contains", value="IFOOD.COM")
+
+    with pytest.raises(ValueError, match="blank"):
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name="Blank description",
+                conditions=[condition],
+                actions=[RuleAction(op="set_description", value="   ")],
+            ),
+        )
+
+    with pytest.raises(ValueError, match="500"):
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name="Long description",
+                conditions=[condition],
+                actions=[RuleAction(op="set_description", value="x" * 501)],
+            ),
+        )
+
+    rule = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Normalize iFood",
+            conditions=[condition],
+            actions=[RuleAction(op="set_description", value="iFood")],
+        ),
+    )
+    payload = await export_rules(session, test_workspace.id)
+    assert payload.version == 1
+    exported = next(item for item in payload.rules if item.name == rule.name)
+    # The list can hold groups now, so narrow before reading a leaf's field.
+    exported_condition = exported.conditions[0]
+    assert isinstance(exported_condition, RuleCondition)
+    assert exported_condition.field == "payee"
+    assert exported.actions[0].op == "set_description"
 # ---------------------------------------------------------------------------
 # apply_rules_to_transaction
 # ---------------------------------------------------------------------------
@@ -390,6 +644,129 @@ async def test_apply_rules_no_match(session: AsyncSession, test_user, test_works
     assert txn.category_id is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply", ["to_transaction", "single_rule", "all_rules"])
+async def test_apply_rules_skips_a_payee_deleted_after_the_rule_was_saved(
+    session: AsyncSession, test_user, test_workspace, apply,
+):
+    """The rule keeps the deleted payee's id. Writing it would fail the
+    flush, so the payee action is dropped and the rest of the rule still
+    runs (#1018)."""
+    from app.services.payee_service import delete_payee
+
+    payee = Payee(user_id=test_user.id, name="Gone")
+    account = Account(
+        id=uuid.uuid4(), user_id=test_user.id, name="StaleAcc",
+        type="checking", balance=Decimal("0"), currency="BRL",
+    )
+    session.add_all([payee, account])
+    await session.commit()
+    rule = await create_rule(
+        session,
+        test_workspace.id, test_user.id,
+        RuleCreate(
+            name="Stale payee",
+            conditions=[RuleCondition(field="description", op="contains", value="UBER")],
+            actions=[
+                RuleAction(op="set_payee", value=str(payee.id)),
+                RuleAction(op="append_notes", value="#ride"),
+            ],
+            apply_to_existing=False,
+        ),
+    )
+    assert await delete_payee(session, payee.id, test_workspace.id) is True
+
+    txn = Transaction(
+        id=uuid.uuid4(), user_id=test_user.id, account_id=account.id,
+        description="UBER TRIP", amount=Decimal("25.50"), date=date(2025, 3, 1),
+        type="debit", source="manual", created_at=datetime.now(timezone.utc),
+    )
+    session.add(txn)
+    await session.commit()
+
+    if apply == "to_transaction":
+        await apply_rules_to_transaction(session, test_user.id, txn)
+    elif apply == "single_rule":
+        await apply_single_rule(session, test_workspace.id, rule)
+    else:
+        await apply_all_rules(session, test_workspace.id)
+
+    assert txn.payee_id is None
+    assert txn.notes == "#ride"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apply", ["to_transaction", "single_rule", "all_rules", "preview"])
+@pytest.mark.parametrize("source", ["transfer", "sync"])
+async def test_rules_never_ignore_a_transfer_leg_but_still_categorize_it(
+    session: AsyncSession, test_user, test_workspace, test_account, test_categories,
+    apply, source,
+):
+    """Ignoring one leg of a transfer, directly or through an ignored
+    category, takes it out of its account's balance while the other leg stays
+    (#1276). Rules skip those two actions on any paired row and keep the rest."""
+    ignored_category, safe_category = test_categories[:2]
+    ignored_category.is_ignored = True
+    await session.commit()
+
+    unsafe_rule = await create_rule(
+        session, test_workspace.id, test_user.id,
+        RuleCreate(
+            name="Hide card payments",
+            conditions=[RuleCondition(field="description", op="contains", value="CARD PAYMENT")],
+            actions=[
+                RuleAction(op="ignore", value=True),
+                RuleAction(op="set_category", value=str(ignored_category.id)),
+                RuleAction(op="append_notes", value="#card"),
+            ],
+            priority=10,
+            apply_to_existing=False,
+        ),
+    )
+    safe_rule = await create_rule(
+        session, test_workspace.id, test_user.id,
+        RuleCreate(
+            name="Categorize card payments",
+            conditions=[RuleCondition(field="description", op="contains", value="CARD PAYMENT")],
+            actions=[RuleAction(op="set_category", value=str(safe_category.id))],
+            priority=20,
+            apply_to_existing=False,
+        ),
+    )
+    leg, ordinary = [
+        Transaction(
+            id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+            account_id=test_account.id, description="CARD PAYMENT",
+            amount=Decimal("25.50"), date=date(2025, 3, 1), type="debit",
+            source=source if paired else "manual",
+            transfer_pair_id=uuid.uuid4() if paired else None, is_ignored=False,
+        )
+        for paired in (True, False)
+    ]
+    session.add_all([leg, ordinary])
+    await session.commit()
+
+    if apply == "to_transaction":
+        for txn in (leg, ordinary):
+            await apply_rules_to_transaction(session, test_user.id, txn)
+    elif apply == "single_rule":
+        await apply_single_rule(session, test_workspace.id, unsafe_rule)
+        await apply_single_rule(session, test_workspace.id, safe_rule)
+    elif apply == "all_rules":
+        await apply_all_rules(session, test_workspace.id)
+    else:
+        leg, ordinary = [
+            await preview_rules_for_transaction(session, test_user.id, txn)
+            for txn in (leg, ordinary)
+        ]
+
+    assert leg.is_ignored is False
+    assert leg.category_id == safe_category.id
+    assert ordinary.is_ignored is True
+    assert ordinary.category_id == ignored_category.id
+    assert leg.notes == ordinary.notes == "#card"
+
+
 # ---------------------------------------------------------------------------
 # apply_all_rules
 # ---------------------------------------------------------------------------
@@ -465,6 +842,440 @@ async def test_apply_all_rules(session: AsyncSession, test_user, test_workspace,
     await session.refresh(txn2)
     assert txn1.category_id == test_categories[1].id  # transport
     assert txn2.category_id == test_categories[0].id  # food
+
+
+@pytest.mark.asyncio
+async def test_apply_all_rules_replaces_edited_normalization_idempotently(
+    session: AsyncSession, test_user, test_workspace
+):
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Normalization",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+    transaction = Transaction(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="D01-123 AMZNPrime DE changing-token",
+        amount=Decimal("19.90"),
+        date=date(2026, 1, 10),
+        type="debit",
+        source="sync",
+    )
+    session.add(transaction)
+    await session.commit()
+    rule = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Editable normalization",
+            conditions=[
+                RuleCondition(
+                    field="description", op="contains", value="AMZNPrime DE"
+                )
+            ],
+            actions=[
+                RuleAction(op="set_description", value="Amazon Prime"),
+                RuleAction(op="append_notes", value="#subscription"),
+            ],
+            apply_to_existing=False,
+        ),
+    )
+
+    assert await apply_all_rules(session, test_workspace.id) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Amazon Prime"
+    assert transaction.original_description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.description_is_rule_managed is True
+    assert transaction.notes == "#subscription"
+
+    await update_rule(
+        session,
+        rule.id,
+        test_workspace.id,
+        RuleUpdate(
+            actions=[
+                RuleAction(op="set_description", value="Prime"),
+                RuleAction(op="append_notes", value="#subscription"),
+            ]
+        ),
+    )
+    assert await apply_all_rules(session, test_workspace.id) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Prime"
+    assert transaction.original_description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.description_is_rule_managed is True
+    assert transaction.notes == "#subscription"
+    await apply_all_rules(session, test_workspace.id)
+    await session.refresh(transaction)
+    assert transaction.description == "Prime"
+    assert transaction.original_description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.description_is_rule_managed is True
+    assert transaction.notes == "#subscription"
+
+    assert await delete_rule(
+        session, rule.id, test_workspace.id
+    ) is True
+    assert await apply_all_rules(session, test_workspace.id) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.original_description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.description_is_rule_managed is False
+
+
+@pytest.mark.asyncio
+async def test_apply_all_rules_preserves_manually_edited_import_description(
+    session: AsyncSession, test_user, test_workspace
+):
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Imported",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    transaction = Transaction(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="BANK RAW DESCRIPTION",
+        original_description="BANK RAW DESCRIPTION",
+        amount=Decimal("12.34"),
+        date=date(2026, 1, 11),
+        type="debit",
+        source="csv",
+        payee="IFOOD.COM RESTAURANTES",
+    )
+    session.add(transaction)
+    await session.commit()
+
+    updated = await update_transaction(
+        session,
+        transaction.id,
+        test_workspace.id,
+        test_user.id,
+        TransactionUpdate(description="Manually edited merchant"),
+    )
+    assert updated is not None
+    assert updated.description_is_rule_managed is False
+
+    await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Stable payee normalization",
+            conditions=[
+                RuleCondition(field="payee", op="contains", value="IFOOD.COM")
+            ],
+            actions=[
+                RuleAction(op="set_description", value="iFood"),
+                RuleAction(op="append_notes", value="#delivery"),
+            ],
+            apply_to_existing=False,
+        ),
+    )
+
+    assert await apply_all_rules(session, test_workspace.id) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Manually edited merchant"
+    assert transaction.original_description == "BANK RAW DESCRIPTION"
+    assert transaction.description_is_rule_managed is False
+    assert transaction.notes == "#delivery"
+
+
+@pytest.mark.asyncio
+async def test_apply_all_rules_preserves_edited_legacy_synced_description(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A synced row from before original_description existed keeps its edit.
+
+    The edit backfills the bank text, which is what lets the rules tell the
+    user's wording apart from the provider's.
+    """
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Synced",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    transaction = Transaction(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="PAG*LOJA 123",
+        original_description=None,
+        amount=Decimal("80.00"),
+        date=date(2026, 1, 12),
+        type="debit",
+        source="sync",
+        payee="LOJA EXEMPLO",
+    )
+    session.add(transaction)
+    await session.commit()
+
+    updated = await update_transaction(
+        session,
+        transaction.id,
+        test_workspace.id,
+        test_user.id,
+        TransactionUpdate(description="Birthday gift"),
+    )
+    assert updated is not None
+    assert updated.original_description == "PAG*LOJA 123"
+
+    await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Loja normalization",
+            conditions=[
+                RuleCondition(field="payee", op="contains", value="LOJA EXEMPLO")
+            ],
+            actions=[
+                RuleAction(op="set_description", value="Loja Exemplo"),
+                RuleAction(op="append_notes", value="#shopping"),
+            ],
+            apply_to_existing=False,
+        ),
+    )
+
+    assert await apply_all_rules(session, test_workspace.id) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Birthday gift"
+    assert transaction.original_description == "PAG*LOJA 123"
+    assert transaction.description_is_rule_managed is False
+    assert transaction.notes == "#shopping"
+
+
+@pytest.mark.asyncio
+async def test_apply_single_rule_preserves_manually_edited_import_description(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Re-saving a normalization rule must not undo the user's own wording.
+
+    `apply_all_rules` already protects a hand-edited description; the same must
+    hold for the far more common path of editing one rule and re-applying it.
+    """
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Imported",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    transaction = Transaction(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="D01-123 AMZNPrime DE changing-token",
+        original_description="D01-123 AMZNPrime DE changing-token",
+        amount=Decimal("19.90"),
+        date=date(2026, 1, 10),
+        type="debit",
+        source="csv",
+    )
+    session.add(transaction)
+    await session.commit()
+
+    rule = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Amazon Prime normalization",
+            conditions=[
+                RuleCondition(field="description", op="contains", value="AMZNPrime")
+            ],
+            actions=[
+                RuleAction(op="set_description", value="Amazon Prime"),
+                RuleAction(op="append_notes", value="#subscription"),
+            ],
+            apply_to_existing=False,
+        ),
+    )
+
+    assert await apply_single_rule(session, test_workspace.id, rule) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Amazon Prime"
+    assert transaction.description_is_rule_managed is True
+
+    updated = await update_transaction(
+        session,
+        transaction.id,
+        test_workspace.id,
+        test_user.id,
+        TransactionUpdate(description="Amazon Prime (family)"),
+    )
+    assert updated is not None
+    assert updated.description_is_rule_managed is False
+
+    # Clear the notes so the re-application has something left to do: the rule
+    # must still match and still run its other actions, and only the typed
+    # description is off limits.
+    transaction.notes = None
+    await session.commit()
+
+    assert await apply_single_rule(session, test_workspace.id, rule) == 1
+    await session.refresh(transaction)
+    assert transaction.description == "Amazon Prime (family)"
+    assert transaction.original_description == "D01-123 AMZNPrime DE changing-token"
+    assert transaction.description_is_rule_managed is False
+    assert transaction.notes == "#subscription"
+
+
+@pytest.mark.asyncio
+async def test_apply_single_rule_prefers_current_description_then_falls_back_to_original(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    account = Account(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        name="Rule chain",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.flush()
+    transaction = Transaction(
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="D01-123 AMZNPrime DE changing-token",
+        amount=Decimal("19.90"),
+        date=date(2026, 1, 10),
+        type="debit",
+        source="sync",
+    )
+    session.add(transaction)
+    await session.commit()
+
+    normalizer = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Normalize Amazon",
+            conditions=[
+                RuleCondition(
+                    field="description", op="contains", value="AMZNPrime DE"
+                )
+            ],
+            actions=[
+                RuleAction(op="set_description", value="Amazon Prime")
+            ],
+            apply_to_existing=False,
+            priority=10,
+        ),
+    )
+    assert await apply_single_rule(
+        session, test_workspace.id, normalizer
+    ) == 1
+    assert transaction.description == "Amazon Prime"
+    assert (
+        transaction.original_description
+        == "D01-123 AMZNPrime DE changing-token"
+    )
+
+    dependent = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Categorize normalized Amazon",
+            conditions=[
+                RuleCondition(
+                    field="description", op="equals", value="Amazon Prime"
+                )
+            ],
+            actions=[
+                RuleAction(
+                    op="set_category", value=str(test_categories[0].id)
+                )
+            ],
+            apply_to_existing=False,
+            priority=20,
+        ),
+    )
+    assert await apply_single_rule(
+        session, test_workspace.id, dependent
+    ) == 1
+    assert transaction.category_id == test_categories[0].id
+    assert await apply_single_rule(
+        session, test_workspace.id, dependent
+    ) == 0
+    negative = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Current-state negative match",
+            conditions=[
+                RuleCondition(
+                    field="description",
+                    op="not_contains",
+                    value="AMZNPrime DE",
+                )
+            ],
+            actions=[RuleAction(op="append_notes", value="#normalized")],
+            apply_to_existing=False,
+            priority=30,
+        ),
+    )
+    assert await apply_single_rule(
+        session, test_workspace.id, negative
+    ) == 1
+    assert transaction.notes == "#normalized"
+    assert await apply_single_rule(
+        session, test_workspace.id, negative
+    ) == 0
+
+    normalizer = await update_rule(
+        session,
+        normalizer.id,
+        test_workspace.id,
+        RuleUpdate(
+            actions=[
+                RuleAction(op="set_description", value="Prime"),
+                RuleAction(
+                    op="set_category", value=str(test_categories[1].id)
+                ),
+            ]
+        ),
+    )
+    assert normalizer is not None
+    assert await apply_single_rule(
+        session, test_workspace.id, normalizer
+    ) == 1
+    assert transaction.description == "Prime"
+    assert (
+        transaction.original_description
+        == "D01-123 AMZNPrime DE changing-token"
+    )
+    assert transaction.category_id == test_categories[0].id
+    assert await apply_single_rule(
+        session, test_workspace.id, normalizer
+    ) == 0
+    assert transaction.category_id == test_categories[0].id
 
 
 @pytest.mark.asyncio
@@ -582,7 +1393,7 @@ async def test_create_default_rules(session: AsyncSession, test_user, test_works
 async def test_install_rule_pack_br(session: AsyncSession, test_user, test_workspace):
     await create_default_categories(session, test_user.id, lang="pt-BR")
 
-    result = await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
+    result = await install_rule_pack(session, test_workspace.id, test_user.id, "BR", lang="pt-BR")
     assert len(result.rules) > 0
     assert result.unresolved == 0
 
@@ -594,8 +1405,8 @@ async def test_install_rule_pack_br(session: AsyncSession, test_user, test_works
 async def test_install_rule_pack_skips_duplicates(session: AsyncSession, test_user, test_workspace):
     await create_default_categories(session, test_user.id, lang="pt-BR")
 
-    first = await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
-    second = await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
+    first = await install_rule_pack(session, test_workspace.id, test_user.id, "BR", lang="pt-BR")
+    second = await install_rule_pack(session, test_workspace.id, test_user.id, "BR", lang="pt-BR")
 
     assert len(first.rules) > 0
     # All rules already installed — distinct from "couldn't install" because
@@ -612,11 +1423,11 @@ async def test_install_rule_pack_works_across_languages(session: AsyncSession, t
     # still resolve the category by internal key.
     await create_default_categories(session, test_user.id, lang="en")
 
-    result = await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
+    result = await install_rule_pack(session, test_workspace.id, test_user.id, "BR", lang="pt-BR")
 
     # Every BR rule's set_category action should have resolved to a real
     # English category UUID, so the pack installs in full.
-    assert len(result.rules) == len(RULE_PACKS["BR"]["rules"])
+    assert len(result.rules) == len(built_in_packs()["BR"].rules)
     assert result.unresolved == 0
 
 
@@ -629,10 +1440,10 @@ async def test_install_rule_pack_reports_unresolved_when_categories_missing(
     # write any rules. The result must surface this so the frontend can
     # tell the user "missing categories" instead of the misleading
     # "pack already installed" toast.
-    result = await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
+    result = await install_rule_pack(session, test_workspace.id, test_user.id, "BR", lang="pt-BR")
 
     assert len(result.rules) == 0
-    assert result.unresolved == len(RULE_PACKS["BR"]["rules"])
+    assert result.unresolved == len(built_in_packs()["BR"].rules)
 
 
 @pytest.mark.asyncio
@@ -644,32 +1455,258 @@ async def test_install_rule_pack_creates_missing_categories_when_opted_in(
     # then install the full rule set.
     result = await install_rule_pack(
         session,
+        test_workspace.id,
         test_user.id,
         "BR",
         lang="pt-BR",
         create_missing_categories=True,
     )
 
-    assert len(result.rules) == len(RULE_PACKS["BR"]["rules"])
+    assert len(result.rules) == len(built_in_packs()["BR"].rules)
     assert result.unresolved == 0
     assert result.categories_created > 0
 
 
 @pytest.mark.asyncio
 async def test_install_rule_pack_unknown_returns_empty(session: AsyncSession, test_user, test_workspace):
-    result = await install_rule_pack(session, test_user.id, "ZZ")
+    result = await install_rule_pack(session, test_workspace.id, test_user.id, "ZZ")
     assert result.rules == []
     assert result.unresolved == 0
 
 
 @pytest.mark.asyncio
-async def test_get_installed_packs(session: AsyncSession, test_user, test_workspace):
+async def test_list_rule_packs_reports_installed(session: AsyncSession, test_user, test_workspace):
+    workspace_id = test_workspace.id
     await create_default_categories(session, test_user.id, lang="pt-BR")
 
-    packs_before = await get_installed_packs(session, test_user.id)
-    assert packs_before["BR"] is False
+    def installed(statuses):
+        return next(s.installed for s in statuses if s.pack.code == "BR")
 
-    await install_rule_pack(session, test_user.id, "BR", lang="pt-BR")
+    assert installed(await list_rule_packs(session, workspace_id)) is False
+    await install_rule_pack(session, workspace_id, test_user.id, "BR", lang="pt-BR")
+    assert installed(await list_rule_packs(session, workspace_id)) is True
 
-    packs_after = await get_installed_packs(session, test_user.id)
-    assert packs_after["BR"] is True
+
+# ---------------------------------------------------------------------------
+# Status condition
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["equals", "not_equals"])
+@pytest.mark.parametrize("value", ["pending", "posted"])
+async def test_create_rule_accepts_status_condition(
+    session: AsyncSession, test_user, test_workspace, op, value
+):
+    rule = await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name=f"Status {op} {value}",
+            conditions=[RuleCondition(field="status", op=op, value=value)],
+            actions=[RuleAction(op="ignore", value=True)],
+        ),
+    )
+    assert rule.conditions == [{"field": "status", "op": op, "value": value}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "value", "expected"),
+    [
+        ("contains", "pending", "Invalid condition: unsupported op 'contains' for field 'status'"),
+        ("regex", "pend", "Invalid condition: unsupported op 'regex' for field 'status'"),
+        ("gt", "pending", "Invalid condition: unsupported op 'gt' for field 'status'"),
+        ("equals", "reserved", "Invalid condition: unsupported status value 'reserved'"),
+    ],
+)
+async def test_create_rule_rejects_invalid_status_condition(
+    session: AsyncSession, test_user, test_workspace, op, value, expected
+):
+    with pytest.raises(ValueError, match=expected):
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name="Bad status",
+                conditions=[RuleCondition(field="status", op=op, value=value)],
+                actions=[RuleAction(op="ignore", value=True)],
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_status_rule_applies_to_pending_transaction_only(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Pending card holds",
+            conditions=[RuleCondition(field="status", op="equals", value="pending")],
+            actions=[RuleAction(op="set_category", value=str(test_categories[1].id))],
+        ),
+    )
+
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        name="StatusAcc",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+
+    pending, posted = (
+        Transaction(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            account_id=account.id,
+            description="CARD PURCHASE",
+            amount=Decimal("12.00"),
+            date=date(2025, 3, 1),
+            type="debit",
+            source="manual",
+            status=status,
+            created_at=datetime.now(timezone.utc),
+        )
+        for status in ("pending", "posted")
+    )
+    session.add_all([pending, posted])
+    await session.commit()
+
+    await apply_rules_to_transaction(session, test_user.id, pending)
+    await apply_rules_to_transaction(session, test_user.id, posted)
+
+    assert (pending.category_id, posted.category_id) == (test_categories[1].id, None)
+
+
+@pytest.mark.asyncio
+async def test_provider_category_rule_applies_to_raw_data_category(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    await create_rule(
+        session,
+        test_workspace.id,
+        test_user.id,
+        RuleCreate(
+            name="Provider category",
+            conditions=[
+                RuleCondition(
+                    field="provider_category", op="equals", value="Eating out"
+                )
+            ],
+            actions=[RuleAction(op="set_category", value=str(test_categories[1].id))],
+        ),
+    )
+
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        name="ProviderCategoryAcc",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+
+    transaction = Transaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        account_id=account.id,
+        description="RESTAURANT",
+        amount=Decimal("45.00"),
+        date=date(2025, 3, 1),
+        type="debit",
+        source="sync",
+        raw_data={"category": "Eating out"},
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(transaction)
+    await session.commit()
+
+    await apply_rules_to_transaction(session, test_user.id, transaction)
+
+    assert transaction.category_id == test_categories[1].id
+
+
+@pytest.mark.asyncio
+async def test_preview_rule_matches_provider_category(
+    session: AsyncSession, test_user, test_workspace
+):
+    account = Account(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        name="ProviderCategoryPreviewAcc",
+        type="checking",
+        balance=Decimal("1000"),
+        currency="BRL",
+    )
+    session.add(account)
+    await session.commit()
+
+    transaction = Transaction(
+        id=uuid.uuid4(),
+        user_id=test_user.id,
+        workspace_id=test_workspace.id,
+        account_id=account.id,
+        description="RESTAURANT",
+        amount=Decimal("45.00"),
+        date=date(2025, 3, 1),
+        type="debit",
+        source="sync",
+        raw_data={"category": "Provider Preview Probe"},
+        created_at=datetime.now(timezone.utc),
+    )
+    session.add(transaction)
+    await session.commit()
+    transaction_id = transaction.id
+    workspace_id = test_workspace.id
+    # The preview request runs in its own session; expire so load_only must
+    # fetch raw_data for real instead of reusing this identity-mapped row.
+    session.expire_all()
+
+    preview = await preview_rule(
+        session,
+        workspace_id,
+        "and",
+        [
+            {
+                "field": "provider_category",
+                "op": "equals",
+                "value": "Provider Preview Probe",
+            }
+        ],
+        [],
+    )
+
+    assert preview.matched == 1
+    assert preview.sample[0].id == transaction_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("op", ["gt", "gte", "lt", "lte"])
+async def test_create_rule_rejects_numeric_op_on_provider_category(
+    session: AsyncSession, test_user, test_workspace, op
+):
+    with pytest.raises(
+        ValueError,
+        match=f"unsupported op '{op}' for field 'provider_category'",
+    ):
+        await create_rule(
+            session,
+            test_workspace.id,
+            test_user.id,
+            RuleCreate(
+                name=f"Provider category {op}",
+                conditions=[RuleCondition(field="provider_category", op=op, value=0)],
+                actions=[RuleAction(op="ignore", value=True)],
+            ),
+        )

@@ -91,6 +91,132 @@ async def test_create_same_currency_transfer(
     assert data["debit"]["transfer_pair_id"] == data["credit"]["transfer_pair_id"]
 
 
+@pytest_asyncio.fixture
+async def manual_accounts(client: AsyncClient, auth_headers) -> list[dict]:
+    """Two manual BRL accounts, whose balance is the sum of their rows."""
+    accounts = []
+    for name, balance in (("Checking", "2000.00"), ("Card", "700.00")):
+        response = await client.post(
+            "/api/accounts",
+            json={"name": name, "type": "checking", "balance": balance, "currency": "BRL"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 201
+        accounts.append(response.json())
+    return accounts
+
+
+async def _balance(client: AsyncClient, auth_headers, account_id: str) -> Decimal:
+    response = await client.get(f"/api/accounts/{account_id}", headers=auth_headers)
+    assert response.status_code == 200
+    return Decimal(str(response.json()["current_balance"]))
+
+
+async def _create_rule(client: AsyncClient, headers, **rule) -> None:
+    response = await client.post(
+        "/api/rules",
+        json={"conditions_op": "and", "is_active": True, **rule},
+        headers=headers,
+    )
+    assert response.status_code == 201, response.text
+
+
+async def _transfer(client: AsyncClient, auth_headers, accounts, description: str) -> dict:
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": accounts[0]["id"],
+            "to_account_id": accounts[1]["id"],
+            "amount": "500.00",
+            "date": "2025-01-15",
+            "description": description,
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+@pytest.mark.asyncio
+async def test_create_transfer_applies_rules_to_each_leg(
+    client: AsyncClient, auth_headers, manual_accounts, test_categories,
+    session: AsyncSession, test_user: User,
+):
+    """Both legs used to stay uncategorized until rules were run by hand (#1276)."""
+    from app.services.workspace_service import create_workspace
+
+    other = await create_workspace(
+        session, name="Other", creator=test_user, self_membership=True, seed_defaults=False
+    )
+    wrong = [{"op": "append_notes", "value": "#wrong"}]
+    match = [{"field": "description", "op": "contains", "value": "CARD PAYMENT"}]
+    await _create_rule(client, auth_headers, name="Inactive", conditions=match,
+                       actions=wrong, is_active=False)
+    await _create_rule(client, {**auth_headers, "X-Workspace-Id": str(other.id)},
+                       name="Other workspace", conditions=match, actions=wrong)
+    for leg_type, category in zip(("debit", "credit"), test_categories[:2]):
+        await _create_rule(
+            client, auth_headers,
+            name=f"Card payment {leg_type}",
+            conditions=[*match, {"field": "type", "op": "equals", "value": leg_type}],
+            actions=[
+                {"op": "set_category", "value": str(category.id)},
+                {"op": "append_notes", "value": f"#{leg_type}"},
+            ],
+        )
+
+    data = await _transfer(client, auth_headers, manual_accounts, "CARD PAYMENT 1234")
+
+    for leg_type, category in zip(("debit", "credit"), test_categories[:2]):
+        stored = (
+            await client.get(f"/api/transactions/{data[leg_type]['id']}", headers=auth_headers)
+        ).json()
+        for leg in (data[leg_type], stored):
+            assert leg["category_id"] == str(category.id)
+            assert leg["notes"] == f"#{leg_type}"
+            assert leg["transfer_pair_id"] == data["transfer_pair_id"]
+            assert Decimal(str(leg["amount"])) == Decimal("500.00")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_leg", ["debit", "credit"])
+@pytest.mark.parametrize("unsafe", ["ignore", "ignored_category"])
+async def test_create_transfer_rules_cannot_take_one_leg_out_of_balances(
+    client: AsyncClient, auth_headers, manual_accounts, test_categories, target_leg, unsafe,
+):
+    """A rule ignoring one leg would make the money arrive without leaving."""
+    if unsafe == "ignored_category":
+        category = await client.post(
+            "/api/categories",
+            json={"name": "Hidden from reports", "is_ignored": True},
+            headers=auth_headers,
+        )
+        assert category.status_code == 201
+        action = {"op": "set_category", "value": category.json()["id"]}
+    else:
+        action = {"op": "ignore", "value": True}
+    await _create_rule(
+        client, auth_headers, name="Unsafe", priority=1,
+        conditions=[{"field": "type", "op": "equals", "value": target_leg}],
+        actions=[action, {"op": "append_notes", "value": "#kept"}],
+    )
+    await _create_rule(
+        client, auth_headers, name="Safe", priority=10,
+        conditions=[{"field": "type", "op": "equals", "value": target_leg}],
+        actions=[{"op": "set_category", "value": str(test_categories[0].id)}],
+    )
+    before = [await _balance(client, auth_headers, a["id"]) for a in manual_accounts]
+
+    data = await _transfer(client, auth_headers, manual_accounts, "Move money")
+
+    after = [await _balance(client, auth_headers, a["id"]) for a in manual_accounts]
+    assert after == [before[0] - Decimal("500.00"), before[1] + Decimal("500.00")]
+    leg = data[target_leg]
+    assert leg["is_ignored"] is False
+    assert leg["category_id"] == str(test_categories[0].id)
+    assert leg["notes"] == "#kept"
+
+
 @pytest.mark.asyncio
 async def test_create_cross_currency_transfer(
     client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
@@ -118,10 +244,10 @@ async def test_create_cross_currency_transfer(
 
 
 @pytest.mark.asyncio
-async def test_create_cross_currency_transfer_with_manual_fx_rate(
+async def test_create_cross_currency_transfer_with_explicit_destination_amount(
     client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
 ):
-    """Cross-currency transfer with manual FX rate should use provided rate."""
+    """Cross-currency transfer should preserve an explicitly supplied destination amount."""
     response = await client.post(
         "/api/transactions/transfer",
         json={
@@ -129,8 +255,8 @@ async def test_create_cross_currency_transfer_with_manual_fx_rate(
             "to_account_id": str(usd_account.id),
             "amount": 1000.00,
             "date": date.today().isoformat(),
-            "description": "Transfer BRL to USD with manual rate",
-            "fx_rate": 0.20,
+            "description": "Transfer BRL to USD with explicit destination amount",
+            "destination_amount": 200.00,
         },
         headers=auth_headers,
     )
@@ -140,8 +266,169 @@ async def test_create_cross_currency_transfer_with_manual_fx_rate(
     assert data["debit"]["currency"] == "BRL"
     assert data["credit"]["currency"] == "USD"
     assert float(data["debit"]["amount"]) == 1000.00
-    # 1000 * 0.20 = 200.00
     assert float(data["credit"]["amount"]) == 200.00
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination_amount", [0, -1])
+async def test_reject_non_positive_destination_amount(
+    client: AsyncClient,
+    auth_headers,
+    test_account: Account,
+    usd_account: Account,
+    destination_amount: int,
+):
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(usd_account.id),
+            "amount": 1000.00,
+            "destination_amount": destination_amount,
+            "date": date.today().isoformat(),
+            "description": "Invalid destination amount",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_reject_destination_amount_for_same_currency_transfer(
+    client: AsyncClient,
+    auth_headers,
+    test_account: Account,
+    second_account: Account,
+):
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(second_account.id),
+            "amount": 100.00,
+            "destination_amount": 100.00,
+            "date": date.today().isoformat(),
+            "description": "Invalid same-currency transfer",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 400
+    assert "destination amount" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_destination_amount_is_rounded_to_cents(
+    client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
+):
+    """Amounts are stored with 2 decimals, so the response must not echo more."""
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(usd_account.id),
+            "amount": 1000.00,
+            "destination_amount": 200.999,
+            "date": date.today().isoformat(),
+            "description": "Transfer with sub-cent destination amount",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 201
+    data = response.json()
+    assert Decimal(str(data["credit"]["amount"])) == Decimal("201.00")
+
+
+@pytest.mark.asyncio
+async def test_reject_removed_fx_rate_field(
+    client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
+):
+    """A client still sending the old `fx_rate` must fail loudly, not be ignored."""
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(usd_account.id),
+            "amount": 1000.00,
+            "fx_rate": 0.20,
+            "date": date.today().isoformat(),
+            "description": "Transfer with legacy fx_rate",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_explicit_destination_amount_survives_source_amount_edit(
+    client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
+):
+    """Both amounts were entered by the user, so editing one must not re-convert the other."""
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(usd_account.id),
+            "amount": 1000.00,
+            "destination_amount": 200.00,
+            "date": date.today().isoformat(),
+            "description": "Transfer with explicit destination amount",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+    data = response.json()
+
+    update_response = await client.patch(
+        f"/api/transactions/{data['debit']['id']}",
+        json={"amount": 1010.00},
+        headers=auth_headers,
+    )
+    assert update_response.status_code == 200
+    assert Decimal(str(update_response.json()["amount"])) == Decimal("1010.00")
+
+    credit_response = await client.get(
+        f"/api/transactions/{data['credit']['id']}", headers=auth_headers
+    )
+    assert credit_response.status_code == 200
+    assert Decimal(str(credit_response.json()["amount"])) == Decimal("200.00")
+
+
+@pytest.mark.asyncio
+async def test_converted_destination_amount_follows_source_amount_edit(
+    client: AsyncClient, auth_headers, test_account: Account, usd_account: Account
+):
+    """Without an explicit destination amount the pair is still kept in sync by FX."""
+    response = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(usd_account.id),
+            "amount": 1000.00,
+            "date": date.today().isoformat(),
+            "description": "Transfer converted automatically",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 201
+    data = response.json()
+    original_credit = Decimal(str(data["credit"]["amount"]))
+
+    update_response = await client.patch(
+        f"/api/transactions/{data['debit']['id']}",
+        json={"amount": 2000.00},
+        headers=auth_headers,
+    )
+    assert update_response.status_code == 200
+
+    credit_response = await client.get(
+        f"/api/transactions/{data['credit']['id']}", headers=auth_headers
+    )
+    assert credit_response.status_code == 200
+    assert Decimal(str(credit_response.json()["amount"])) == original_credit * 2
 
 
 @pytest.mark.asyncio
@@ -216,8 +503,10 @@ async def test_delete_cascades_to_paired_transaction(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("new_amount", ["450.00", None], ids=["amount-change", "amount-omitted"])
 async def test_update_cascades_to_paired_transaction(
-    client: AsyncClient, auth_headers, test_account: Account, second_account: Account
+    client: AsyncClient, auth_headers, test_account: Account, second_account: Account,
+    new_amount,
 ):
     # Create transfer
     response = await client.post(
@@ -236,11 +525,14 @@ async def test_update_cascades_to_paired_transaction(
     debit_id = data["debit"]["id"]
     credit_id = data["credit"]["id"]
 
-    # Update debit description and date
+    # Update description and date, optionally changing the amount.
     new_date = "2025-06-15"
+    payload = {"description": "Updated description", "date": new_date}
+    if new_amount is not None:
+        payload["amount"] = new_amount
     update_response = await client.patch(
         f"/api/transactions/{debit_id}",
-        json={"description": "Updated description", "date": new_date},
+        json=payload,
         headers=auth_headers,
     )
     assert update_response.status_code == 200
@@ -253,6 +545,7 @@ async def test_update_cascades_to_paired_transaction(
     credit_data = credit_response.json()
     assert credit_data["description"] == "Updated description"
     assert credit_data["date"] == new_date
+    assert Decimal(str(credit_data["amount"])) == Decimal(new_amount or "300.00")
 
 
 @pytest.mark.asyncio
@@ -992,3 +1285,75 @@ async def test_transfers_appear_in_transaction_list(
     transfer_txns = [tx for tx in items if tx.get("transfer_pair_id") == transfer_pair_id]
     assert len(transfer_txns) == 2
     assert {tx["type"] for tx in transfer_txns} == {"debit", "credit"}
+
+
+@pytest.mark.asyncio
+async def test_get_transfer_pair_returns_counterpart(
+    client: AsyncClient, auth_headers, test_account: Account, second_account: Account
+):
+    """Each leg resolves to the other leg of the pair."""
+    created = await client.post(
+        "/api/transactions/transfer",
+        json={
+            "from_account_id": str(test_account.id),
+            "to_account_id": str(second_account.id),
+            "amount": 500.00,
+            "date": date.today().isoformat(),
+            "description": "Transfer to savings",
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201
+    debit = created.json()["debit"]
+    credit = created.json()["credit"]
+
+    # Debit -> credit
+    response = await client.get(
+        f"/api/transactions/{debit['id']}/transfer-pair", headers=auth_headers
+    )
+    assert response.status_code == 200
+    pair = response.json()
+    assert pair["id"] == credit["id"]
+    assert pair["type"] == "credit"
+    assert pair["account_id"] == str(second_account.id)
+    assert float(pair["amount"]) == 500.00
+
+    # Credit -> debit (symmetric)
+    response = await client.get(
+        f"/api/transactions/{credit['id']}/transfer-pair", headers=auth_headers
+    )
+    assert response.status_code == 200
+    assert response.json()["id"] == debit["id"]
+
+
+@pytest.mark.asyncio
+async def test_get_transfer_pair_null_when_not_a_transfer(
+    client: AsyncClient, auth_headers, test_account: Account
+):
+    """A transaction with no transfer_pair_id resolves to null, not an error."""
+    created = await client.post(
+        "/api/transactions",
+        json={
+            "account_id": str(test_account.id),
+            "description": "Groceries",
+            "amount": 42.00,
+            "date": date.today().isoformat(),
+            "type": "debit",
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201
+
+    response = await client.get(
+        f"/api/transactions/{created.json()['id']}/transfer-pair", headers=auth_headers
+    )
+    assert response.status_code == 200
+    assert response.json() is None
+
+
+@pytest.mark.asyncio
+async def test_get_transfer_pair_404_for_unknown_transaction(client: AsyncClient, auth_headers):
+    response = await client.get(
+        f"/api/transactions/{uuid.uuid4()}/transfer-pair", headers=auth_headers
+    )
+    assert response.status_code == 404

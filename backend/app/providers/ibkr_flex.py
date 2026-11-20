@@ -56,6 +56,8 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+from app.core.config import Settings
+
 from app.agents.services.crypto import decrypt, encrypt
 from app.providers.base import (
     AccountData,
@@ -147,7 +149,8 @@ def _flex_date(value: Any) -> Optional[date]:
 class IbkrFlexProvider(BankProvider):
     """Interactive Brokers Flex Query connector (read-only, polling-based)."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
+        super().__init__(settings)
         # keyed by (token, query_id) -> (fetched_at_monotonic, ET.Element root)
         self._cache: dict[tuple[str, str], tuple[float, ET.Element]] = {}
 

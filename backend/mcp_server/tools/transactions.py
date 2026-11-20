@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.group import GroupMember
 from app.services import transaction_service
+from app.services._query_filters import reporting_date_value
 from mcp_server.auth import CallContext
 from mcp_server.registry import tool
 from mcp_server.tools._helpers import num, parse_date, parse_uuid, parse_uuid_list, resolve_workspace_id
@@ -32,7 +33,14 @@ from mcp_server.tools._helpers import num, parse_date, parse_uuid, parse_uuid_li
         "`list_groups`, and `splits.members[]` shows each "
         "{member_id, member_name, is_self, share_amount, share_type, "
         "share_pct}. So 'is this transaction split?' is just `splits != "
-        "null`; no extra tool call needed."
+        "null`; no extra tool call needed. Separately, `category_lines` is "
+        "non-null when ONE transaction's amount is divided across several "
+        "categories (e.g. a supermarket receipt: 120 groceries + 80 "
+        "household): its `category_id` is then null on purpose, it is NOT "
+        "uncategorized, and each part is {category_id, category_name, "
+        "amount, share_pct}. Reports count each part in its own category. "
+        "Filtering by a category returns a split row when any part matches, "
+        "and `matched_amount` is the part inside that filter."
     ),
     parameters={
         "type": "object",
@@ -64,6 +72,7 @@ from mcp_server.tools._helpers import num, parse_date, parse_uuid, parse_uuid_li
                 "description": "Maximum absolute amount (primary-currency view).",
             },
             "tx_type": {"type": "string", "enum": ["debit", "credit"], "description": "debit = expense, credit = income"},
+            "status": {"type": "string", "enum": ["posted", "pending"], "description": "Filter by posting status: posted = settled, pending = not yet settled."},
             "uncategorized": {"type": "boolean", "default": False, "description": "Only transactions without a category"},
             "exclude_transfers": {"type": "boolean", "default": False, "description": "Exclude transfers between user's own accounts"},
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Match any of these tags"},
@@ -108,6 +117,7 @@ async def list_transactions(
     min_amount: float | None = None,
     max_amount: float | None = None,
     tx_type: str | None = None,
+    status: str | None = None,
     uncategorized: bool = False,
     exclude_transfers: bool = False,
     tags: list[str] | None = None,
@@ -137,6 +147,7 @@ async def list_transactions(
         min_amount=float(min_amount) if min_amount is not None else None,
         max_amount=float(max_amount) if max_amount is not None else None,
         txn_type=tx_type,
+        status=status,
         uncategorized=uncategorized,
         exclude_transfers=exclude_transfers,
         tags=tags or None,
@@ -160,6 +171,19 @@ async def list_transactions(
             select(GroupMember).where(GroupMember.id.in_(member_ids))
         )).scalars().all()
         member_lookup = {m.id: m for m in rows}
+
+    def _category_lines_summary(t: Any) -> list[dict[str, Any]] | None:
+        if not getattr(t, "has_category_lines", False):
+            return None
+        return [
+            {
+                "category_id": str(line.category_id),
+                "category_name": line.category.name if line.category else None,
+                "amount": num(line.amount),
+                "share_pct": num(line.share_pct),
+            }
+            for line in sorted(t.category_lines, key=lambda line: line.position)
+        ]
 
     def _splits_summary(t: Any) -> dict[str, Any] | None:
         splits = getattr(t, "splits", None) or []
@@ -194,6 +218,10 @@ async def list_transactions(
             "id": str(t.id),
             "date": t.date.isoformat() if t.date else None,
             "effective_date": t.effective_date.isoformat() if getattr(t, "effective_date", None) else None,
+            "reporting_date": reporting_date_value(t, accounting_mode or "cash").isoformat(),
+            "reporting_date_override": (
+                t.reporting_date_override.isoformat() if t.reporting_date_override else None
+            ),
             "description": t.description,
             "amount": num(t.amount),
             "currency": t.currency,
@@ -201,15 +229,17 @@ async def list_transactions(
             "type": t.type,
             "status": getattr(t, "status", None),
             "category_id": str(t.category_id) if t.category_id else None,
-            "category_name": t.category.name if getattr(t, "category", None) else None,
+            "category_name": t.category.name if t.category else None,
             "account_id": str(t.account_id) if t.account_id else None,
             "account_name": t.account.name if getattr(t, "account", None) else None,
             "payee_id": str(t.payee_id) if getattr(t, "payee_id", None) else None,
-            "payee_name": t.payee_entity.name if getattr(t, "payee_entity", None) else None,
+            "payee_name": t.payee_entity.name if t.payee_entity else None,
             "tags": getattr(t, "tags", None),
             "is_transfer": bool(getattr(t, "transfer_pair_id", None)),
             "notes": getattr(t, "notes", None),
             "splits": _splits_summary(t),
+            "category_lines": _category_lines_summary(t),
+            "matched_amount": num(getattr(t, "matched_amount", None)),
         }
         for t in txs
     ]

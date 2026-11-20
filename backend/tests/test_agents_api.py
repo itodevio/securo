@@ -383,9 +383,10 @@ async def test_generate_title_uses_llm(
     ])
     await session.commit()
 
+    provider = _Scripted()
     with patch(
         "app.agents.runtime.executor._provider_and_model_for",
-        return_value=(_Scripted(), "gpt-4o-mini"),
+        return_value=(provider, "gpt-4o-mini"),
     ):
         r = await client.post(
             f"/api/agents/conversations/{conv.id}/generate-title",
@@ -393,6 +394,8 @@ async def test_generate_title_uses_llm(
         )
     assert r.status_code == 200, r.text
     assert r.json()["title"] == "Brazilian Cuisine Picks"
+    # The title request carries the same session id as the chat run.
+    assert provider.session_id == str(conv.id)
 
 
 async def test_generate_title_strips_reasoning_tags(
@@ -481,3 +484,93 @@ async def test_put_tools_persists_selection(
 
     pairs = await agent_service.allowed_tool_pairs(session, a.id)
     assert pairs == {("securo", "list_transactions")}
+
+
+async def test_create_with_tools_scopes_the_agent_in_one_step(
+    client: AsyncClient, auth_headers: dict, session: AsyncSession
+):
+    """An agent created with a tool list has its whitelist from the start,
+    so it is never left running with every discovered tool."""
+    from app.agents.services.agent_service import allowed_tool_pairs
+
+    resp = await client.post("/api/agents", headers=auth_headers, json={
+        "name": "1188 Scoped",
+        "tools": [
+            {"server": "securo", "tool_name": "list_budgets", "enabled": True},
+            {"server": "securo", "tool_name": "get_budget_vs_actual", "enabled": True},
+        ],
+    })
+    assert resp.status_code == 201, resp.text
+    allowed = await allowed_tool_pairs(session, uuid.UUID(resp.json()["id"]))
+    assert allowed == {("securo", "list_budgets"), ("securo", "get_budget_vs_actual")}
+
+
+def _discover_returning(*names: str):
+    from app.agents.mcp.client import ToolHandle
+
+    async def _discover(self, *, user_id, workspace_id=None, conversation_id=None, agent_id=None):
+        return [ToolHandle(server="securo", name=n, description="", parameters={}) for n in names]
+    return patch("app.agents.api.agents.MCPRegistry.discover", new=_discover)
+
+
+async def test_create_without_tools_enables_every_discovered_tool(
+    client: AsyncClient, auth_headers: dict, session: AsyncSession
+):
+    from app.agents.services.agent_service import allowed_tool_pairs
+
+    with _discover_returning("list_accounts", "list_budgets"):
+        resp = await client.post("/api/agents", headers=auth_headers, json={"name": "All"})
+    assert resp.status_code == 201, resp.text
+    allowed = await allowed_tool_pairs(session, uuid.UUID(resp.json()["id"]))
+    assert allowed == {("securo", "list_accounts"), ("securo", "list_budgets")}
+
+
+async def test_create_with_empty_tools_has_no_tools(
+    client: AsyncClient, auth_headers: dict, session: AsyncSession
+):
+    from app.agents.services.agent_service import allowed_tool_pairs
+
+    with _discover_returning("list_accounts"):
+        resp = await client.post("/api/agents", headers=auth_headers, json={"name": "None", "tools": []})
+        assert resp.status_code == 201, resp.text
+        aid = resp.json()["id"]
+        listing = (await client.get(f"/api/agents/{aid}/tools", headers=auth_headers)).json()
+    assert await allowed_tool_pairs(session, uuid.UUID(aid)) == set()
+    assert [t["enabled"] for t in listing["tools"]] == [False]
+
+
+async def test_tool_discovered_after_creation_starts_disabled(
+    client: AsyncClient, auth_headers: dict
+):
+    with _discover_returning("list_accounts"):
+        aid = (await client.post("/api/agents", headers=auth_headers, json={"name": "Later"})).json()["id"]
+    with _discover_returning("list_accounts", "delete_everything"):
+        listing = (await client.get(f"/api/agents/{aid}/tools", headers=auth_headers)).json()
+    assert {t["name"]: t["enabled"] for t in listing["tools"]} == {
+        "list_accounts": True,
+        "delete_everything": False,
+    }
+
+
+async def test_create_with_tools_is_atomic(
+    session: AsyncSession, test_user, test_workspace
+):
+    """If the tool rows cannot be written, the agent is not created either:
+    no agent is left behind without its whitelist (which means allow-all)."""
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
+
+    from app.agents.models.agent import Agent
+    from app.agents.schemas.agent import AgentCreate, AgentToolToggle
+    from app.agents.services.agent_service import create_agent
+
+    duplicate = AgentToolToggle(server="securo", tool_name="list_budgets", enabled=True)
+    data = AgentCreate(name="1188 Atomic", tools=[duplicate, duplicate])
+    with pytest.raises(IntegrityError):
+        await create_agent(session, test_workspace.id, test_user.id, data)
+    await session.rollback()
+
+    rows = (await session.execute(
+        select(Agent).where(Agent.name == "1188 Atomic")
+    )).scalars().all()
+    assert rows == []

@@ -7,10 +7,13 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
+from app.models.category import Category
 from app.models.transaction import Transaction
+from app.services._query_filters import counts_as_pnl
 from app.services.transfer_detection_service import (
     detect_transfer_pairs,
     unlink_transfer_pair,
@@ -125,7 +128,13 @@ async def test_detect_no_credits(session: AsyncSession, test_user, test_workspac
 
 @pytest.mark.asyncio
 async def test_detect_respects_date_tolerance(session: AsyncSession, test_user, test_workspace):
-    """Only pairs transactions within date_tolerance_days."""
+    """Only pairs transactions inside the window the rules ask for.
+
+    The window used to be an argument to this function and is now a
+    condition on a rule somebody can read and change. Two days is what
+    ships, and what this asserts, because the point of moving it was to
+    keep the behaviour and expose the number.
+    """
     acc1 = await _make_account(session, test_user.id, "Tol A")
     acc2 = await _make_account(session, test_user.id, "Tol B")
     today = date.today()
@@ -134,7 +143,7 @@ async def test_detect_respects_date_tolerance(session: AsyncSession, test_user, 
     # Credit too far away (5 days)
     await _add_txn(session, test_user.id, acc2.id, 300, "credit", today + timedelta(days=5))
 
-    pairs = await detect_transfer_pairs(session, test_workspace.id, date_tolerance_days=2)
+    pairs = await detect_transfer_pairs(session, test_workspace.id)
     assert pairs == 0
 
 
@@ -148,7 +157,7 @@ async def test_detect_within_tolerance(session: AsyncSession, test_user, test_wo
     debit = await _add_txn(session, test_user.id, acc1.id, 400, "debit", today)
     credit = await _add_txn(session, test_user.id, acc2.id, 400, "credit", today + timedelta(days=1))
 
-    pairs = await detect_transfer_pairs(session, test_workspace.id, date_tolerance_days=2)
+    pairs = await detect_transfer_pairs(session, test_workspace.id)
     await session.commit()
     assert pairs == 1
 
@@ -247,6 +256,65 @@ async def test_unlink_transfer_pair(session: AsyncSession, test_user, test_works
     await session.refresh(credit)
     assert debit.transfer_pair_id is None
     assert credit.transfer_pair_id is None
+
+
+@pytest.mark.asyncio
+async def test_unlinked_legs_count_in_pnl_until_given_a_transfer_category(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """What the unlink dialog warns about (issue #1160).
+
+    Unlinking only clears the pair id: a leg with no category starts
+    counting in income and expense totals, while a leg whose category is
+    flagged `treat_as_transfer` keeps it and stays out, and giving a leg
+    such a category takes it out again.
+    """
+    acc1 = await _make_account(session, test_user.id, "Report A")
+    acc2 = await _make_account(session, test_user.id, "Report B")
+    today = date.today()
+    transfers = Category(
+        id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id,
+        name="Transfers", treat_as_transfer=True,
+    )
+    session.add(transfers)
+    await session.commit()
+
+    debit = await _add_txn(session, test_user.id, acc1.id, 1374.96, "debit", today)
+    credit = await _add_txn(session, test_user.id, acc2.id, 1374.96, "credit", today)
+    credit.category_id = transfers.id
+    await session.commit()
+    await detect_transfer_pairs(session, test_workspace.id)
+    await session.commit()
+    await session.refresh(debit)
+    pair_id = debit.transfer_pair_id
+    assert pair_id is not None
+
+    async def pnl_ids() -> set[uuid.UUID]:
+        rows = await session.execute(
+            select(Transaction.id).where(
+                Transaction.workspace_id == test_workspace.id,
+                counts_as_pnl(Transaction.category_id),
+            )
+        )
+        return set(rows.scalars())
+
+    assert (await pnl_ids()) == set()
+
+    await unlink_transfer_pair(session, test_workspace.id, pair_id)
+    await session.commit()
+    await session.refresh(debit)
+    await session.refresh(credit)
+
+    # Nothing but the link changes: same categories, same amounts.
+    assert debit.category_id is None
+    assert credit.category_id == transfers.id
+    assert debit.amount == credit.amount == Decimal("1374.96")
+    assert (await pnl_ids()) == {debit.id}
+
+    debit.category_id = transfers.id
+    await session.commit()
+
+    assert (await pnl_ids()) == set()
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import UUID
@@ -8,6 +8,10 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
 from app.core.database import Base
+
+if TYPE_CHECKING:
+    from app.agents.models.conversation import Conversation
+    from app.agents.models.knowledge import KnowledgeDoc
 
 
 class Agent(Base):
@@ -57,24 +61,36 @@ class Agent(Base):
     # At most one agent per user has is_default=True (enforced by partial
     # unique index). The global slide-over chat panel uses this agent.
     is_default: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # False until the agent's tool list has been written out as AgentTool
+    # rows. While False, the first discovery records every tool it finds as
+    # enabled; after that, only rows grant access and a tool that shows up
+    # later starts disabled.
+    tools_initialized: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     tools: Mapped[list["AgentTool"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
-    conversations: Mapped[list["Conversation"]] = relationship(back_populates="agent", cascade="all, delete-orphan")  # noqa: F821
-    knowledge_docs: Mapped[list["KnowledgeDoc"]] = relationship(back_populates="agent", cascade="all, delete-orphan")  # noqa: F821
+    conversations: Mapped[list["Conversation"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
+    knowledge_docs: Mapped[list["KnowledgeDoc"]] = relationship(back_populates="agent", cascade="all, delete-orphan")
+
+    # Virtual attributes populated by agent_service queries (not DB columns).
+    conversation_count = cast(int, 0)
+    knowledge_count = cast(int, 0)
 
 
 class AgentTool(Base):
     """Per-agent tool whitelist. Tools are discovered from registered MCP
-    servers; this row records that the user has enabled a given tool for a
-    given agent. Absence = disabled (closed-by-default for safety on writes).
+    servers; a row with enabled=True lets the agent call that tool. No row
+    means disabled, including for tools that appear after the agent's list
+    was initialized (see Agent.tools_initialized).
     """
     __tablename__ = "agent_tools"
 
     agent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("agents.id", ondelete="CASCADE"), primary_key=True)
-    server: Mapped[str] = mapped_column(String(80), primary_key=True)
-    tool_name: Mapped[str] = mapped_column(String(120), primary_key=True)
+    # An extra server without an alias is named by its URL (see _parse_servers).
+    server: Mapped[str] = mapped_column(String(500), primary_key=True)
+    # MCP allows tool names up to 128 characters; room to spare, never truncated.
+    tool_name: Mapped[str] = mapped_column(String(255), primary_key=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
 
     agent: Mapped["Agent"] = relationship(back_populates="tools")

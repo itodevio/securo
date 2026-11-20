@@ -1,18 +1,26 @@
-import { useState, useCallback, useEffect } from 'react'
-import { getAccountName } from '@/lib/account-utils'
+import { useState, useCallback, useEffect, useMemo, lazy, Suspense } from 'react'
+import {
+  getAccountName,
+  sidebarAccountBalance,
+  sidebarAccounts,
+  sortAccountsByAbsoluteBalance,
+  sumAccountsTotal,
+} from '@/lib/account-utils'
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale } from '@/hooks/use-display-locale'
 import { useQuery } from '@tanstack/react-query'
 import { useAuth } from '@/contexts/auth-context'
 import { useCollectionFilter } from '@/contexts/collection-filter-context'
+import { useWorkspace } from '@/contexts/workspace-context'
+import { useSidebarState } from '@/contexts/sidebar-state-context'
 import { CollectionSelector } from '@/components/collection-selector'
-import { auth as authApi, backup as backupApi, admin as adminApi } from '@/lib/api'
+import { ConnectionLost } from '@/components/connection-lost'
+import { auth as authApi } from '@/lib/api'
 import { resolveSupportedLang } from '@/lib/i18n'
-import { toast } from 'sonner'
 import { OnboardingTour } from '@/components/onboarding-tour'
 import { useTheme } from 'next-themes'
-import { accounts as accountsApi } from '@/lib/api'
+import { accounts as accountsApi, transactions as transactionsApi } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import {
@@ -33,25 +41,16 @@ import { ShellLogo } from '@/components/shell-logo'
 import { UpdateAvailableBanner } from '@/components/update-available-banner'
 import { UpdateAvailableDialog } from '@/components/update-available-dialog'
 import { WorkspaceSwitcher } from '@/components/workspace-switcher'
+import { navItems, visibleNavItems, type NavItem } from '@/lib/nav-items'
 import {
-  ArrowLeftRight,
-  Building2,
-  SlidersHorizontal,
-  Upload,
   Menu,
+  ChevronLeft,
   ChevronRight,
-  Tag,
-  PiggyBank,
-  Target,
   Eye,
   EyeOff,
-  Repeat,
-  Landmark,
-  Users,
-  Split,
-  BarChart3,
   Sun,
   Moon,
+  Monitor,
   Languages,
   KeyRound,
   Check,
@@ -59,47 +58,47 @@ import {
   Shield,
   ShieldCheck,
   Fingerprint,
+  Palette,
+  AlertCircle,
 } from 'lucide-react'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
 import { ChangePasswordDialog } from '@/components/change-password-dialog'
+import { BackupDialog } from '@/components/backup-dialog'
 import { TwoFactorSetup } from '@/components/two-factor-setup'
 import { PasskeyManagementDialog } from '@/components/passkey-management-dialog'
 import { CommandPalette } from '@/components/command-palette'
 import { useCommandPaletteHotkey } from '@/hooks/use-command-palette-hotkey'
 import { GlobalChatPanel } from '@/components/global-chat-panel'
 import { useFeatureFlags } from '@/hooks/use-feature-flags'
-import { Bot, Search, Sparkles } from 'lucide-react'
-import { setThemeBasedOnSystem } from '@/lib/theme-utils'
+import { Bot, Flag, Plus, Puzzle, Search, Sparkles } from 'lucide-react'
+import { useAppTheme } from '@/hooks/use-app-theme'
+import { LibraryProvider } from '@/components/library-provider'
+import { useLibrary } from '@/contexts/library-context'
+import { AssistantContext } from '@/contexts/assistant-context'
+import { nextTheme, THEME_LABEL_KEY } from '@/lib/theme-cycle'
+import { useLocalAuthEnabled } from '@/hooks/use-local-auth'
+import { formatCurrency } from '@/lib/format'
 
-type NavItem =
-  | { type: 'link'; key: string; path: string; icon: React.ElementType }
-  | { type: 'separator'; labelKey: string }
+const QuickAddTransaction = lazy(() => import('@/components/quick-add-transaction'))
 
-const navItems: NavItem[] = [
-  // The dashboard ("Painel") is now reachable by clicking the Securo
-  // logo + name in the sidebar header — no dedicated menu item to keep
-  // the sidebar focused on the main destinations. Transactions sits
-  // inside the ACCOUNTS section since it's account-scoped data.
-  { type: 'separator', labelKey: 'nav.groupAccounts' },
-  { type: 'link', key: 'transactions', path: '/transactions', icon: ArrowLeftRight },
-  { type: 'link', key: 'accounts', path: '/accounts', icon: Building2 },
-  { type: 'link', key: 'import', path: '/import', icon: Upload },
-  { type: 'separator', labelKey: 'nav.groupAnalysis' },
-  { type: 'link', key: 'reports', path: '/reports', icon: BarChart3 },
-  { type: 'link', key: 'assets', path: '/assets', icon: Landmark },
-  { type: 'separator', labelKey: 'nav.groupSetup' },
-  { type: 'link', key: 'budgets', path: '/budgets', icon: PiggyBank },
-  { type: 'link', key: 'goals', path: '/goals', icon: Target },
-  { type: 'link', key: 'recurring', path: '/recurring', icon: Repeat },
-  { type: 'link', key: 'categories', path: '/categories', icon: Tag },
-  { type: 'link', key: 'payees', path: '/payees', icon: Users },
-  { type: 'link', key: 'splitGroups', path: '/groups', icon: Split },
-  { type: 'link', key: 'rules', path: '/rules', icon: SlidersHorizontal },
-]
-
-function formatCurrency(value: number, currency = 'USD', locale = 'en-US') {
-  return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(
-    value,
+/** Placeholder rows shown while the workspace's module list is in flight. */
+function NavSkeleton() {
+  return (
+    <div className="flex flex-col gap-0.5" aria-hidden>
+      {[3, 2, 7].map((count, section) => (
+        <div key={section} className={cn('flex flex-col gap-0.5', section > 0 && 'pt-3')}>
+          <div className="px-3 pt-1 pb-1">
+            <div className="h-2 w-16 rounded bg-sidebar-accent/60 animate-pulse" />
+          </div>
+          {Array.from({ length: count }).map((_, row) => (
+            <div key={row} className="flex items-center gap-3 px-3 py-2">
+              <div className="h-4 w-4 rounded bg-sidebar-accent/60 animate-pulse" />
+              <div className="h-3 flex-1 max-w-[7rem] rounded bg-sidebar-accent/40 animate-pulse" />
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -109,32 +108,53 @@ export function AppLayout() {
   const { activeAccountIds } = useCollectionFilter()
   const userCurrency = user?.preferences?.currency_display ?? 'USD'
   const locale = useDisplayLocale()
-  const { theme, setTheme, resolvedTheme } = useTheme()
+  const { theme, setTheme } = useTheme()
+  // The theme picked from the library, kept on the page in light and dark.
+  useAppTheme()
   const location = useLocation()
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [quickAddOpen, setQuickAddOpen] = useState(false)
+  const { collapsed: desktopSidebarCollapsed, toggleCollapsed: toggleDesktopSidebar } = useSidebarState()
   const [accountsExpanded, setAccountsExpanded] = useState(true)
   const [accountsShowAll, setAccountsShowAll] = useState(false)
   const { privacyMode, togglePrivacyMode, mask } = usePrivacyMode()
   const [changePasswordOpen, setChangePasswordOpen] = useState(false)
   const [twoFactorOpen, setTwoFactorOpen] = useState(false)
   const [passkeysOpen, setPasskeysOpen] = useState(false)
-  const [backingUp, setBackingUp] = useState(false)
+  const [backupOpen, setBackupOpen] = useState(false)
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
+  // A message the assistant widget sent, waiting for the chat to pick it up.
+  const [chatMessage, setChatMessage] = useState<string | null>(null)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   useCommandPaletteHotkey(setPaletteOpen)
   const { agentsEnabled } = useFeatureFlags()
+  const {
+    hasModule,
+    isLoading: workspaceLoading,
+    loadFailed: workspaceLoadFailed,
+    refresh: refreshWorkspaces,
+    canWrite,
+  } = useWorkspace()
+  // The chat is offered only to members who can write. Sending a message
+  // reaches a tool set that persists — `propose_create_transaction` and its
+  // siblings — so the backend refuses it for a read-only role. Showing the
+  // panel anyway would put a raw `403: {"detail":"Read-only role"}` in front
+  // of the user, which is what happened before this guard.
+  //
+  // This costs a viewer the ability to *ask* questions, which is a real use
+  // case. Restoring it means making the agent's tools role-aware so a
+  // read-only session only exposes the reading ones; then this becomes
+  // `agentsEnabled` again.
+  const chatAvailable = agentsEnabled && canWrite
+  const localAuthEnabled = useLocalAuthEnabled()
 
   // ⌘J / Ctrl+J toggles the global slide-over chat from anywhere.
   // Distinct from ⌘K (command palette) so users can have both open.
   // Gated on agentsEnabled so the hotkey is a no-op when the feature is
   // off — keeps ⌘J free for browsers/other tools.
   useEffect(() => {
-    adminApi.defaultColors().then(({ light, dark }) => {
-      setThemeBasedOnSystem(light, dark, resolvedTheme)
-    }).catch(() => {})
-    
-    if (!agentsEnabled) return
+    if (!chatAvailable) return
     const handler = (e: KeyboardEvent) => {
       const isMod = e.metaKey || e.ctrlKey
       if (isMod && (e.key === 'j' || e.key === 'J')) {
@@ -144,12 +164,15 @@ export function AppLayout() {
     }
     document.addEventListener('keydown', handler)
     return () => document.removeEventListener('keydown', handler)
-  }, [agentsEnabled, resolvedTheme])
+  }, [chatAvailable])
   // The "Agents" management page used to live in the sidebar, but it's
   // a configuration surface (KB upload, providers, default selection),
   // not a daily destination. Moved to the user menu (Change password,
   // 2FA, Backups, AI agents).
-  const finalNavItems: NavItem[] = navItems
+  const finalNavItems: NavItem[] = useMemo(
+    () => visibleNavItems(navItems, hasModule),
+    [hasModule],
+  )
   const isMac =
     typeof navigator !== 'undefined' &&
     /Mac|iPhone|iPad|iPod/.test(navigator.platform)
@@ -173,38 +196,74 @@ export function AppLayout() {
     }
   }, [user, updateUser])
 
+  const assistant = useMemo(
+    () => ({
+      available: chatAvailable,
+      ask: (message: string) => {
+        setChatMessage(message)
+        setChatOpen(true)
+      },
+    }),
+    [chatAvailable],
+  )
+
   const userInitial = user?.email?.charAt(0).toUpperCase() ?? '?'
-  const resolvedThemeLocal = theme === 'system' ? undefined : theme
-  const isDark = resolvedThemeLocal
-    ? resolvedThemeLocal === 'dark'
-    : typeof window !== 'undefined' &&
-      window.matchMedia?.('(prefers-color-scheme: dark)').matches
-  const toggleTheme = () => setTheme(isDark ? 'light' : 'dark')
+  // The button shows, and switches to, the next theme in the cycle.
+  const upcomingTheme = nextTheme(theme)
+  const themeButtonLabel = t(THEME_LABEL_KEY[upcomingTheme])
+  const ThemeIcon = { light: Sun, dark: Moon, system: Monitor }[upcomingTheme]
+  const toggleTheme = () => setTheme(upcomingTheme)
 
   const { data: accountsList } = useQuery({
     queryKey: ['accounts'],
     queryFn: () => accountsApi.list(),
+    // Without a workspace the request has no scope and can only fail.
+    enabled: !workspaceLoadFailed,
   })
 
-  const allAccounts = accountsList ?? []
+  // Flagged rows past their reminder date, counted next to Transactions.
+  // Under the 'transactions' key so any edit to a row refreshes it.
+  const { data: flaggedSummary } = useQuery({
+    queryKey: ['transactions', 'flagged-summary'],
+    queryFn: () => transactionsApi.flaggedSummary(),
+    enabled: hasModule('transactions'),
+    staleTime: 60_000,
+  })
+  const overdueFlags = flaggedSummary?.overdue ?? 0
+
+  const allAccounts = sidebarAccounts(accountsList ?? [])
   // When a collection is active, the sidebar list + total reflect only its
   // accounts (issue #105). null = all accounts.
   const visibleAccounts = activeAccountIds
     ? allAccounts.filter((a) => activeAccountIds.includes(a.id))
     : allAccounts
-  const totalBalance = visibleAccounts.reduce((sum, a) => {
-    return sum + Number(a.balance_primary ?? a.current_balance)
-  }, 0)
+  const totalBalance = sumAccountsTotal(visibleAccounts)
+  // A foreign account without a real rate adds its native amount, so the
+  // total is an estimate; flag it like the dashboard does (#1165, #1474).
+  const totalHasFxFallback = visibleAccounts.some((a) => a.fx_fallback)
   const versionA11yLabel = t('app.versionAriaLabel', { version: APP_VERSION })
 
+  // The workspace list could not be fetched: nothing here is "off", the data
+  // is simply unavailable. Rendering the shell would show an accountless
+  // sidebar and an empty page, so say what happened and keep the URL (#292).
+  if (workspaceLoadFailed) {
+    return (
+      <div className="flex min-h-dvh items-center justify-center bg-background">
+        <ConnectionLost onRetry={() => { void refreshWorkspaces() }} />
+      </div>
+    )
+  }
+
   return (
-    <div className="min-h-screen bg-background">
+    <AssistantContext.Provider value={assistant}>
+    <LibraryProvider>
+    <div className="min-h-dvh bg-background">
       {/* Mobile header */}
       <header className="sticky top-0 z-40 flex h-14 items-center gap-3 bg-sidebar border-b border-sidebar-border px-4 lg:hidden">
         <button
           onClick={() => setSidebarOpen(!sidebarOpen)}
           className="text-sidebar-muted hover:text-sidebar-foreground transition-colors"
-          aria-label="Toggle menu"
+          aria-label={t('app.toggleMenu')}
         >
           <Menu size={20} />
         </button>
@@ -219,7 +278,7 @@ export function AppLayout() {
             {t('app.name')}
           </span>
         </Link>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ms-auto flex items-center gap-2">
           <button
             onClick={() => setPaletteOpen(true)}
             className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1"
@@ -238,17 +297,15 @@ export function AppLayout() {
           <button
             onClick={toggleTheme}
             className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1"
-            title={isDark ? t('settings.themeLight') : t('settings.themeDark')}
-            aria-label={
-              isDark ? t('settings.themeLight') : t('settings.themeDark')
-            }
+            title={themeButtonLabel}
+            aria-label={themeButtonLabel}
           >
-            {isDark ? <Sun size={18} /> : <Moon size={18} />}
+            <ThemeIcon size={18} />
           </button>
           {/* AI chat — opens the global slide-over (also reachable via
               ⌘J). Sits next to the theme toggle so the icon is always
               within thumb reach on mobile too. */}
-          {agentsEnabled && (
+          {chatAvailable && (
             <button
               onClick={() => setChatOpen(true)}
               className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1"
@@ -264,19 +321,9 @@ export function AppLayout() {
             onChangePassword={() => setChangePasswordOpen(true)}
             onTwoFactor={() => setTwoFactorOpen(true)}
             onPasskeys={() => setPasskeysOpen(true)}
+            localAuthEnabled={localAuthEnabled}
             agentsEnabled={agentsEnabled}
-            backingUp={backingUp}
-            onBackup={async () => {
-              setBackingUp(true)
-              try {
-                await backupApi.download()
-                toast.success(t('backup.success'))
-              } catch {
-                toast.error(t('backup.error'))
-              } finally {
-                setBackingUp(false)
-              }
-            }}
+            onBackup={() => setBackupOpen(true)}
             dark
             isAdmin={user?.is_superuser}
           />
@@ -294,15 +341,24 @@ export function AppLayout() {
 
         {/* Sidebar */}
         <aside
+          data-collapsed={desktopSidebarCollapsed}
           className={cn(
-            'fixed inset-y-0 left-0 z-50 w-60 bg-sidebar border-r border-sidebar-border flex flex-col transform transition-transform lg:translate-x-0 shrink-0',
-            sidebarOpen ? 'translate-x-0' : '-translate-x-full',
+            'group/sidebar fixed inset-y-0 start-0 z-50 w-60 bg-sidebar border-e border-sidebar-border flex flex-col transform transition-[transform,width] duration-300 ease-in-out motion-reduce:transition-none lg:translate-x-0 shrink-0',
+            sidebarOpen ? 'translate-x-0' : 'max-lg:-translate-x-full max-lg:rtl:translate-x-full',
+            desktopSidebarCollapsed ? 'lg:w-16' : 'lg:w-60',
           )}
         >
           {/* Logo — clickable link to the dashboard. Replaces the
               dedicated 'Painel' nav item so the sidebar stays focused
               on the main destinations. */}
-          <div className="flex h-16 min-h-16 items-center justify-between px-5 border-b border-sidebar-border shrink-0">
+          {/* Collapsed on desktop, the header becomes a column: logo on
+              top, then the same privacy / chat / theme buttons stacked,
+              so nothing the expanded header offers goes missing in the
+              rail. */}
+          <div className={cn(
+            'flex h-16 min-h-16 items-center justify-between px-5 border-b border-sidebar-border shrink-0',
+            desktopSidebarCollapsed && 'lg:h-auto lg:min-h-0 lg:flex-col lg:justify-center lg:gap-2 lg:px-0 lg:py-3',
+          )}>
             <Link
               to="/"
               className="flex items-center gap-2.5 -mx-1 px-1 py-1 rounded-md hover:bg-sidebar-accent transition-colors"
@@ -311,14 +367,23 @@ export function AppLayout() {
               title={t('nav.dashboard')}
             >
               <ShellLogo size={24} className="text-primary shrink-0" />
-              <span className="font-bold text-lg text-sidebar-foreground tracking-tight">
+              <span className={cn(
+                'font-bold text-lg text-sidebar-foreground tracking-tight',
+                desktopSidebarCollapsed && 'lg:hidden',
+              )}>
                 {t('app.name')}
               </span>
             </Link>
-            <div className="flex items-center gap-0.5">
+            <div className={cn(
+              'flex items-center gap-0.5',
+              desktopSidebarCollapsed && 'lg:flex-col lg:gap-1',
+            )}>
               <button
                 onClick={togglePrivacyMode}
-                className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent"
+                className={cn(
+                  'text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent',
+                  desktopSidebarCollapsed && 'lg:flex lg:h-9 lg:w-9 lg:items-center lg:justify-center lg:p-0 lg:[&>svg]:h-[18px] lg:[&>svg]:w-[18px]',
+                )}
                 title={privacyMode ? t('privacy.show') : t('privacy.hide')}
                 aria-label={privacyMode ? t('privacy.show') : t('privacy.hide')}
               >
@@ -327,10 +392,13 @@ export function AppLayout() {
               {/* AI chat — same trigger as the mobile bar, ⌘J also
                   works. Lives in the sidebar header so the entry point
                   is visible even on first load (no floating button). */}
-              {agentsEnabled && (
+              {chatAvailable && (
                 <button
                   onClick={() => setChatOpen(true)}
-                  className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent"
+                  className={cn(
+                    'text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent',
+                    desktopSidebarCollapsed && 'lg:flex lg:h-9 lg:w-9 lg:items-center lg:justify-center lg:p-0 lg:[&>svg]:h-[18px] lg:[&>svg]:w-[18px]',
+                  )}
                   title={`${t('agents.globalChat.title', 'Chat')} (${isMac ? '⌘J' : 'Ctrl+J'})`}
                   aria-label={t('agents.globalChat.openHint', 'Open chat (⌘J)')}
                 >
@@ -339,21 +407,35 @@ export function AppLayout() {
               )}
               <button
                 onClick={toggleTheme}
-                className="text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent"
-                title={
-                  isDark ? t('settings.themeLight') : t('settings.themeDark')
-                }
-                aria-label={
-                  isDark ? t('settings.themeLight') : t('settings.themeDark')
-                }
+                className={cn(
+                  'text-sidebar-muted hover:text-sidebar-foreground transition-colors p-1 rounded-md hover:bg-sidebar-accent',
+                  desktopSidebarCollapsed && 'lg:flex lg:h-9 lg:w-9 lg:items-center lg:justify-center lg:p-0 lg:[&>svg]:h-[18px] lg:[&>svg]:w-[18px]',
+                )}
+                title={themeButtonLabel}
+                aria-label={themeButtonLabel}
               >
-                {isDark ? <Sun size={16} /> : <Moon size={16} />}
+                <ThemeIcon size={16} />
               </button>
             </div>
           </div>
 
+          {/* The collapse handle sits on the sidebar's edge, halfway out,
+              vertically centred in the viewport: the border is the thing
+              that moves, so that is where the control lives. Shown on
+              hover and on keyboard focus so it never crowds the header. */}
+          <button
+            type="button"
+            onClick={toggleDesktopSidebar}
+            className="hidden lg:flex absolute top-1/2 -end-3 -translate-y-1/2 h-6 w-6 items-center justify-center rounded-full border border-border bg-card text-muted-foreground shadow-sm opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover/sidebar:opacity-100"
+            title={desktopSidebarCollapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}
+            aria-label={desktopSidebarCollapsed ? t('nav.expandSidebar') : t('nav.collapseSidebar')}
+            aria-expanded={!desktopSidebarCollapsed}
+          >
+            {desktopSidebarCollapsed ? <ChevronRight size={14} /> : <ChevronLeft size={14} />}
+          </button>
+
           {/* Command palette trigger */}
-          <div className="px-3 pt-3">
+          <div className={cn('px-3 pt-3', desktopSidebarCollapsed && 'lg:px-2')}>
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
@@ -361,12 +443,13 @@ export function AppLayout() {
                 'group flex w-full items-center gap-2 rounded-lg border border-sidebar-border/80 bg-sidebar-accent/40 px-3 py-2',
                 'text-[12.5px] text-sidebar-muted transition-all',
                 'hover:bg-sidebar-accent hover:text-sidebar-foreground hover:border-sidebar-border',
+                desktopSidebarCollapsed && 'lg:justify-center lg:px-0',
               )}
               aria-label={t('cmdk.triggerAria')}
             >
               <Search size={13} className="shrink-0" />
-              <span className="flex-1 text-left">{t('cmdk.triggerLabel')}</span>
-              <kbd className="hidden lg:inline-flex h-[17px] items-center rounded border border-sidebar-border bg-sidebar px-1 font-mono text-[9.5px] font-semibold text-sidebar-muted/80">
+              <span className={cn('flex-1 text-start', desktopSidebarCollapsed && 'lg:hidden')}>{t('cmdk.triggerLabel')}</span>
+              <kbd className={cn('hidden lg:inline-flex h-[17px] items-center rounded border border-sidebar-border bg-sidebar px-1 font-mono text-[9.5px] font-semibold text-sidebar-muted/80', desktopSidebarCollapsed && 'lg:hidden')}>
                 {isMac ? '⌘' : 'Ctrl'}&nbsp;K
               </kbd>
             </button>
@@ -374,8 +457,12 @@ export function AppLayout() {
 
           <div className="flex-1 min-h-0 overflow-y-auto">
           {/* Nav */}
-          <nav className="flex flex-col gap-0.5 px-3 pt-1 pb-3" data-tour="sidebar">
-            {finalNavItems.map((item, idx) => {
+          <nav className={cn('flex flex-col gap-0.5 px-3 pt-1 pb-3', desktopSidebarCollapsed && 'lg:items-center lg:gap-1 lg:px-0 lg:pt-3')} data-tour="sidebar">
+            {/* Which modules this workspace shows is resolved server-side,
+                so until the workspace list lands there is no honest answer
+                — a placeholder beats both an empty sidebar and a guess. */}
+            {workspaceLoading && <NavSkeleton />}
+            {!workspaceLoading && finalNavItems.map((item, idx) => {
               if (item.type === 'separator') {
                 // The first separator sits right below the search bar
                 // — without trimming the top padding it leaves a wide
@@ -383,7 +470,10 @@ export function AppLayout() {
                 // from the search trigger.
                 const isFirstSep = idx === 0
                 return (
-                  <div key={`sep-${idx}`} className={cn(isFirstSep ? 'pt-1 pb-1 px-3' : 'pt-3 pb-1 px-3')}>
+                  <div key={`sep-${idx}`} className={cn(
+                    isFirstSep ? 'pt-1 pb-1 px-3' : 'pt-3 pb-1 px-3',
+                    desktopSidebarCollapsed && 'lg:hidden',
+                  )}>
                     <span className="text-[10px] uppercase tracking-[0.12em] font-semibold text-sidebar-muted/50">
                       {t(item.labelKey)}
                     </span>
@@ -396,17 +486,21 @@ export function AppLayout() {
                   ? location.pathname === '/'
                   : location.pathname.startsWith(item.path)
               const Icon = item.icon
-              return (
+              const showQuickAdd = item.key === 'transactions' && canWrite
+              const link = (
                 <Link
                   key={item.key}
                   to={item.path}
                   data-tour={`nav-${item.key}`}
                   onClick={() => setSidebarOpen(false)}
+                  title={t(`nav.${item.key}`)}
+                  aria-label={t(`nav.${item.key}`)}
                   className={cn(
                     'flex items-center gap-3 text-[13px] font-medium transition-all rounded-lg px-3 py-2',
                     isActive
-                      ? 'bg-primary/[0.08] text-primary border-l-[3px] border-primary pl-[9px]'
+                      ? 'bg-primary/[0.08] text-primary border-s-[3px] border-primary ps-[9px]'
                       : 'text-sidebar-muted hover:bg-sidebar-accent hover:text-sidebar-foreground',
+                    desktopSidebarCollapsed && 'lg:h-10 lg:w-10 lg:justify-center lg:border-s-0 lg:px-0 lg:ps-0',
                   )}
                 >
                   <Icon
@@ -414,17 +508,65 @@ export function AppLayout() {
                     className={cn(
                       'shrink-0',
                       isActive ? 'text-primary' : 'text-sidebar-muted',
+                      desktopSidebarCollapsed && 'lg:h-5 lg:w-5',
                     )}
                   />
-                  <span>{t(`nav.${item.key}`)}</span>
+                  <span className={cn(desktopSidebarCollapsed && 'lg:hidden')}>{t(`nav.${item.key}`)}</span>
                 </Link>
+              )
+              const overdueBadge = item.key === 'transactions' && overdueFlags > 0 ? (
+                <Link
+                  to="/transactions?flagged=overdue"
+                  onClick={() => setSidebarOpen(false)}
+                  title={t('transactions.flagOverdueCount', { count: overdueFlags })}
+                  aria-label={t('transactions.flagOverdueCount', { count: overdueFlags })}
+                  data-testid="nav-overdue-flags"
+                  className={cn(
+                    'absolute inline-flex h-5 min-w-5 items-center justify-center gap-0.5 rounded-full bg-rose-500/15 px-1.5 text-[10px] font-semibold text-rose-600 transition-colors hover:bg-rose-500/25 dark:text-rose-400',
+                    showQuickAdd ? 'end-9' : 'end-2',
+                    desktopSidebarCollapsed && 'lg:end-0.5 lg:top-0.5 lg:h-4 lg:min-w-4 lg:px-1 lg:text-[9px]',
+                  )}
+                >
+                  <Flag size={10} className={cn('fill-current', desktopSidebarCollapsed && 'lg:hidden')} />
+                  {overdueFlags > 99 ? '99+' : overdueFlags}
+                </Link>
+              ) : null
+              if (!showQuickAdd && !overdueBadge) return link
+              if (!showQuickAdd) {
+                return (
+                  <div key={item.key} className="relative flex items-center">
+                    <div className="min-w-0 flex-1">{link}</div>
+                    {overdueBadge}
+                  </div>
+                )
+              }
+              return (
+                <div key={item.key} className="relative flex items-center">
+                  <div className="min-w-0 flex-1">{link}</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSidebarOpen(false)
+                      setQuickAddOpen(true)
+                    }}
+                    title={t('transactions.addManual')}
+                    aria-label={t('transactions.addManual')}
+                    className={cn(
+                      'absolute end-2 flex h-6 w-6 items-center justify-center rounded-md border border-sidebar-border bg-sidebar text-sidebar-muted transition-colors hover:bg-sidebar-accent hover:text-sidebar-foreground',
+                      desktopSidebarCollapsed && 'lg:hidden',
+                    )}
+                  >
+                    <Plus size={14} />
+                  </button>
+                  {overdueBadge}
+                </div>
               )
             })}
           </nav>
 
           {/* Account list in sidebar */}
           {allAccounts.length > 0 && (
-            <div className="px-3 pb-2 mt-2">
+            <div className={cn('px-3 pb-2 mt-2', desktopSidebarCollapsed && 'lg:hidden')}>
               <button
                 onClick={() => setAccountsExpanded(!accountsExpanded)}
                 className="flex items-center justify-between w-full px-3 py-2 hover:text-sidebar-foreground transition-colors"
@@ -433,6 +575,9 @@ export function AppLayout() {
                   {t('accounts.title')}
                 </span>
                 <div className="flex items-center gap-2">
+                  {totalHasFxFallback && (
+                    <AlertCircle size={12} aria-hidden="true" className="shrink-0 text-amber-500" />
+                  )}
                   <span
                     className={`tabular-nums font-medium text-xs ${totalBalance < 0 ? 'text-rose-400' : 'text-sidebar-muted'}`}
                   >
@@ -447,14 +592,17 @@ export function AppLayout() {
                   />
                 </div>
               </button>
+              {/* Visible text, not a hover title, so keyboard and touch users can read it. */}
+              {totalHasFxFallback && (
+                <p className="px-3 pb-1 text-[11px] text-amber-700 dark:text-amber-400">
+                  {t('transactions.fxFallbackBanner')}
+                </p>
+              )}
               {accountsExpanded && (
                 <div className="mt-1 space-y-0.5">
-                  {[...visibleAccounts].sort((a, b) => Math.abs(Number(b.current_balance)) - Math.abs(Number(a.current_balance))).slice(0, accountsShowAll ? visibleAccounts.length : 3).map((acc) => {
-                    const balance = Number(acc.current_balance)
-                    const prevBalance = acc.previous_balance ?? 0
-                    const pctChange = prevBalance !== 0
-                      ? ((balance - prevBalance) / Math.abs(prevBalance)) * 100
-                      : null
+                  {sortAccountsByAbsoluteBalance(visibleAccounts, (a) => sidebarAccountBalance(a).amount).slice(0, accountsShowAll ? visibleAccounts.length : 3).map((acc) => {
+                    const { amount: balance, isPrimary: balanceIsPrimary } = sidebarAccountBalance(acc)
+                    const balanceCurrency = balanceIsPrimary ? userCurrency : acc.currency
                     const typeKey = acc.type.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase()).replace(/^./, c => c.toUpperCase())
 
                     return (
@@ -468,17 +616,13 @@ export function AppLayout() {
                           <span className="block truncate font-medium">{getAccountName(acc)}</span>
                           <span className="block text-[10px] text-sidebar-muted/60">
                             {t(`accounts.type${typeKey}`)}
+                            {acc.shared_balance_group && ` · ${t('accounts.sharedCreditBalance')}`}
                           </span>
                         </div>
-                        <div className="text-right shrink-0 ml-2">
+                        <div className="text-end shrink-0 ms-2">
                           <span className={`block tabular-nums font-medium text-xs ${balance < 0 ? 'text-rose-400' : 'text-sidebar-foreground'}`}>
-                            {mask(formatCurrency(balance, acc.currency, locale))}
+                            {mask(formatCurrency(balance, balanceCurrency, locale))}
                           </span>
-                          {pctChange !== null && (
-                            <span className={`block text-[10px] tabular-nums font-medium ${pctChange >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                              {mask(`${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(1)}%`)}
-                            </span>
-                          )}
                         </div>
                       </Link>
                     )
@@ -502,36 +646,29 @@ export function AppLayout() {
           )}
           </div>
 
-          <UpdateAvailableBanner onOpen={() => setUpdateDialogOpen(true)} />
+          <div className={cn(desktopSidebarCollapsed && 'lg:hidden')}>
+            <UpdateAvailableBanner onOpen={() => setUpdateDialogOpen(true)} />
+          </div>
 
           {/* Merged account + workspace menu — one trigger at the
               bottom of the sidebar shows the active workspace as the
               primary identity, the user email + role as the secondary
               line, and combines workspace switching with all the
               account actions that used to live in a separate dropdown. */}
-          <div className="px-3 pt-1">
+          <div className={cn('px-3 pt-1', desktopSidebarCollapsed && 'lg:px-2')}>
             <WorkspaceSwitcher
-              backingUp={backingUp}
               onChangePassword={() => setChangePasswordOpen(true)}
               onTwoFactor={() => setTwoFactorOpen(true)}
               onPasskeys={() => setPasskeysOpen(true)}
-              onBackup={async () => {
-                setBackingUp(true)
-                try {
-                  await backupApi.download()
-                  toast.success(t('backup.success'))
-                } catch {
-                  toast.error(t('backup.error'))
-                } finally {
-                  setBackingUp(false)
-                }
-              }}
+              localAuthEnabled={localAuthEnabled}
+              onBackup={() => setBackupOpen(true)}
               onUpdateAvailable={() => setUpdateDialogOpen(true)}
               agentsEnabled={agentsEnabled}
+              collapsed={desktopSidebarCollapsed}
             />
           </div>
 
-          <div className="px-3 pb-3 pt-1">
+          <div className={cn('px-3 pb-3 pt-1', desktopSidebarCollapsed && 'lg:hidden')}>
             <div
               className="text-[11px] leading-4 text-sidebar-muted/70 text-center"
               role="note"
@@ -545,7 +682,10 @@ export function AppLayout() {
         </aside>
 
         {/* Main content */}
-        <main className="flex-1 min-h-screen overflow-x-hidden lg:ml-60">
+        <main className={cn(
+          'flex-1 min-h-dvh overflow-x-hidden transition-[margin] duration-300 ease-in-out motion-reduce:transition-none',
+          desktopSidebarCollapsed ? 'lg:ms-16' : 'lg:ms-60',
+        )}>
           <div className="p-6 max-w-7xl mx-auto">
             {/* Active-collection filter (issue #105): sticky bar above the
                 content so the scope is visible right where the data is. */}
@@ -556,28 +696,47 @@ export function AppLayout() {
       </div>
 
       {showTour && <OnboardingTour onComplete={handleTourComplete} />}
-      <ChangePasswordDialog
-        open={changePasswordOpen}
-        onClose={() => setChangePasswordOpen(false)}
-      />
+      {localAuthEnabled && (
+        <ChangePasswordDialog
+          open={changePasswordOpen}
+          onClose={() => setChangePasswordOpen(false)}
+        />
+      )}
       <TwoFactorSetup
         open={twoFactorOpen}
         onClose={() => setTwoFactorOpen(false)}
+        localAuthEnabled={localAuthEnabled}
       />
       <PasskeyManagementDialog
         open={passkeysOpen}
         onClose={() => setPasskeysOpen(false)}
+        localAuthEnabled={localAuthEnabled}
       />
+      <BackupDialog open={backupOpen} onClose={() => setBackupOpen(false)} />
+      {quickAddOpen && (
+        <Suspense fallback={null}>
+          <QuickAddTransaction open={quickAddOpen} onClose={() => setQuickAddOpen(false)} />
+        </Suspense>
+      )}
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
       {/* Slide-over global chat — opened from the sidebar pill or via
           ⌘J. The previous floating bottom-right button was removed
           since the entry point now lives in the sidebar next to ⌘K. */}
-      {agentsEnabled && <GlobalChatPanel open={chatOpen} onOpenChange={setChatOpen} />}
+      {chatAvailable && (
+        <GlobalChatPanel
+          open={chatOpen}
+          onOpenChange={setChatOpen}
+          initialMessage={chatMessage}
+          onInitialMessageSent={() => setChatMessage(null)}
+        />
+      )}
       <UpdateAvailableDialog
         open={updateDialogOpen}
         onClose={() => setUpdateDialogOpen(false)}
       />
     </div>
+    </LibraryProvider>
+    </AssistantContext.Provider>
   )
 }
 
@@ -587,8 +746,8 @@ function UserMenu({
   onChangePassword,
   onTwoFactor,
   onPasskeys,
+  localAuthEnabled,
   onBackup,
-  backingUp,
   dark,
   isAdmin,
   agentsEnabled,
@@ -598,19 +757,22 @@ function UserMenu({
   onChangePassword: () => void
   onTwoFactor: () => void
   onPasskeys: () => void
+  localAuthEnabled: boolean
   onBackup: () => void
-  backingUp: boolean
   dark?: boolean
   isAdmin?: boolean
   agentsEnabled?: boolean
 }) {
+  const { user } = useAuth()
   const { t, i18n } = useTranslation()
   const nav = useNavigate()
+  const { openLibrary } = useLibrary()
+  const { pluginsEnabled } = useFeatureFlags()
   const currentLang = resolveSupportedLang(i18n.resolvedLanguage ?? i18n.language)
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="ghost" className="relative h-8 w-8 rounded-full p-0">
+        <Button variant="ghost" className="relative h-8 w-8 rounded-full p-0" aria-label={t('common.userMenu')}>
           <Avatar className="h-8 w-8">
             <AvatarFallback
               className={
@@ -637,20 +799,27 @@ function UserMenu({
             <DropdownMenuSeparator />
           </>
         )}
-        <DropdownMenuItem
-          onClick={onChangePassword}
-          className="flex items-center gap-2"
-        >
-          <KeyRound size={14} />
-          {t('auth.changePassword')}
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={onTwoFactor}
-          className="flex items-center gap-2"
-        >
-          <ShieldCheck size={14} />
-          {t('auth.twoFactorTitle')}
-        </DropdownMenuItem>
+        {localAuthEnabled && (
+          <DropdownMenuItem
+            onClick={onChangePassword}
+            className="flex items-center gap-2"
+          >
+            <KeyRound size={14} />
+            {t('auth.changePassword')}
+          </DropdownMenuItem>
+        )}
+        {/* Enrolled factors outlive the switch to OIDC-only. Hiding these
+            entries would strand the user with a factor and no way to remove
+            it, since the product has no recovery codes. */}
+        {(localAuthEnabled || user?.is_2fa_enabled) && (
+          <DropdownMenuItem
+            onClick={onTwoFactor}
+            className="flex items-center gap-2"
+          >
+            <ShieldCheck size={14} />
+            {t(localAuthEnabled ? 'auth.twoFactorTitle' : 'auth.disable2fa')}
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem
           onClick={onPasskeys}
           className="flex items-center gap-2"
@@ -659,12 +828,11 @@ function UserMenu({
           {t('auth.passkeysTitle')}
         </DropdownMenuItem>
         <DropdownMenuItem
-          disabled={backingUp}
           onClick={onBackup}
           className="flex items-center gap-2"
         >
           <HardDriveDownload size={14} />
-          {backingUp ? t('backup.downloading') : t('backup.button')}
+          {t('backup.button')}
         </DropdownMenuItem>
         {agentsEnabled && (
           <DropdownMenuItem
@@ -675,6 +843,22 @@ function UserMenu({
             {t('nav.aiAgents')}
           </DropdownMenuItem>
         )}
+        {pluginsEnabled && (
+          <DropdownMenuItem
+            onClick={() => nav('/plugins')}
+            className="flex items-center gap-2"
+          >
+            <Puzzle size={14} />
+            {t('plugins.title')}
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          onClick={() => openLibrary('themes')}
+          className="flex items-center gap-2"
+        >
+          <Palette size={14} />
+          {t('library.appearance')}
+        </DropdownMenuItem>
         <DropdownMenuSub>
           <DropdownMenuSubTrigger className="flex items-center gap-2">
             <Languages size={14} />
@@ -719,8 +903,17 @@ function UserMenu({
                 onClick={() => i18n.changeLanguage('pt-BR')}
                 className="flex items-center gap-2"
               >
-                <span className="flex-1">Português</span>
+                <span className="flex-1">Português (BR)</span>
                 {currentLang === 'pt-BR' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('pt-PT')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Português (PT)</span>
+                {currentLang === 'pt-PT' && (
                   <Check size={13} className="text-primary" />
                 )}
               </DropdownMenuItem>
@@ -739,6 +932,15 @@ function UserMenu({
               >
                 <span className="flex-1">Español</span>
                 {currentLang === 'es' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('hi')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">हिन्दी</span>
+                {currentLang === 'hi' && (
                   <Check size={13} className="text-primary" />
                 )}
               </DropdownMenuItem>
@@ -766,6 +968,69 @@ function UserMenu({
               >
                 <span className="flex-1">Français</span>
                 {currentLang === 'fr' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('nl')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Nederlands</span>
+                {currentLang === 'nl' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('cs')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Čeština</span>
+                {currentLang === 'cs' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('sk')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Slovenčina</span>
+                {currentLang === 'sk' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('hu')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Magyar</span>
+                {currentLang === 'hu' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('el')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">Ελληνικά</span>
+                {currentLang === 'el' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('ja')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">日本語</span>
+                {currentLang === 'ja' && (
+                  <Check size={13} className="text-primary" />
+                )}
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => i18n.changeLanguage('he')}
+                className="flex items-center gap-2"
+              >
+                <span className="flex-1">עברית</span>
+                {currentLang === 'he' && (
                   <Check size={13} className="text-primary" />
                 )}
               </DropdownMenuItem>

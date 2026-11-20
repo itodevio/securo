@@ -1,12 +1,15 @@
-import { useEffect, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useDateLocale } from '@/hooks/use-display-locale'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { auth as authApi, currencies as currenciesApi, workspaces as workspacesApi } from '@/lib/api'
+import { auth as authApi, currencies as currenciesApi, fiscal as fiscalApi, workspaces as workspacesApi } from '@/lib/api'
+import { useTimezones } from '@/hooks/use-timezone'
+import { TimezoneSelect } from '@/components/timezone-select'
 import { useAuth } from '@/contexts/auth-context'
 import { useWorkspace } from '@/contexts/workspace-context'
+import { useLocalAuthEnabled } from '@/hooks/use-local-auth'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -14,6 +17,8 @@ import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { IconPicker } from '@/components/icon-picker'
+import { PluginsSection } from '@/components/plugins-section'
+import { useFeatureFlags } from '@/hooks/use-feature-flags'
 import { CategoryIcon } from '@/components/category-icon'
 import {
   Popover,
@@ -36,7 +41,12 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { AlertTriangle, Archive, Plus, Save, Trash2, Users } from 'lucide-react'
-import type { WorkspaceMember, WorkspaceRole } from '@/types'
+import { WORKSPACE_KIND_LABEL_KEY } from '@/lib/workspace-kinds'
+import { AccountantExportSection } from '@/components/accountant-export'
+import { SUPPORTED_LANGS } from '@/lib/i18n'
+import { countryFlag } from '@/lib/country-flag'
+import { countryName } from '@/lib/country-name'
+import type { WorkspaceKind, WorkspaceMember, WorkspaceRole } from '@/types'
 
 function labelForRole(role: WorkspaceRole, t: (key: string) => string): string {
   return {
@@ -72,16 +82,19 @@ const DEFAULT_WORKSPACE_COLOR = '#6366F1'
 const DEFAULT_WORKSPACE_ICON = 'briefcase'
 
 export default function WorkspaceSettingsPage() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const navigate = useNavigate()
   const localeForFormat = useDateLocale()
   const { current, canManage, workspaces: allWorkspaces, refresh, switchWorkspace } = useWorkspace()
+  const { pluginsEnabled } = useFeatureFlags()
   const { user: currentUser, updateUser } = useAuth()
   const queryClient = useQueryClient()
 
   const [editName, setEditName] = useState('')
   const [editCurrency, setEditCurrency] = useState('')
   const [editLocale, setEditLocale] = useState('')
+  const [editJurisdiction, setEditJurisdiction] = useState('')
+  const [editTimezone, setEditTimezone] = useState('')
   const [editIcon, setEditIcon] = useState(DEFAULT_WORKSPACE_ICON)
   const [editColor, setEditColor] = useState(DEFAULT_WORKSPACE_COLOR)
   const [inviteOpen, setInviteOpen] = useState(false)
@@ -91,14 +104,28 @@ export default function WorkspaceSettingsPage() {
   const [removeTarget, setRemoveTarget] = useState<WorkspaceMember | null>(null)
   const [archiveOpen, setArchiveOpen] = useState(false)
 
-  useEffect(() => {
-    if (!current) return
-    setEditName(current.name)
-    setEditCurrency(current.default_currency)
-    setEditLocale(current.locale ?? '')
-    setEditIcon(current.icon ?? DEFAULT_WORKSPACE_ICON)
-    setEditColor(current.color ?? DEFAULT_WORKSPACE_COLOR)
-  }, [current?.id, current?.name, current?.default_currency, current?.locale, current?.icon, current?.color])
+  const formKey = JSON.stringify([current?.id, current?.name, current?.default_currency, current?.locale, current?.tax_jurisdiction, current?.timezone, current?.icon, current?.color])
+  const [previousFormKey, setPreviousFormKey] = useState<string | null>(null)
+  if (formKey !== previousFormKey) {
+    setPreviousFormKey(formKey)
+    if (current) {
+      setEditName(current.name)
+      setEditCurrency(current.default_currency)
+      setEditLocale(current.locale ?? '')
+      setEditJurisdiction(current.tax_jurisdiction ?? '')
+      setEditTimezone(current.timezone ?? '')
+      setEditIcon(current.icon ?? DEFAULT_WORKSPACE_ICON)
+      setEditColor(current.color ?? DEFAULT_WORKSPACE_COLOR)
+    }
+  }
+
+  // Which jurisdictions ship a pack. An empty choice is valid, not missing:
+  // with none set, documents are stored as free text with no mask.
+  const { data: jurisdictions } = useQuery({
+    queryKey: ['fiscal-jurisdictions'],
+    queryFn: fiscalApi.jurisdictions,
+    staleTime: Infinity,
+  })
 
   const membersQuery = useQuery({
     queryKey: ['workspace-members', current?.id],
@@ -111,6 +138,22 @@ export default function WorkspaceSettingsPage() {
     queryFn: currenciesApi.list,
     staleTime: Infinity,
   })
+
+  // Every workspace can keep its own calendar; the default is what the
+  // application runs on when a workspace has none.
+  const { data: timezoneOptions } = useTimezones()
+
+  const localAuthEnabled = useLocalAuthEnabled()
+
+  // The server lists codes; the user reads names. Sorted by the name actually
+  // shown, in the reader's own collation.
+  const sortedJurisdictions = useMemo(
+    () =>
+      [...(jurisdictions ?? [])].sort((a, b) =>
+        countryName(a, i18n.language).localeCompare(countryName(b, i18n.language), i18n.language),
+      ),
+    [jurisdictions, i18n.language],
+  )
 
   const statsQuery = useQuery({
     queryKey: ['workspace-stats', current?.id],
@@ -125,6 +168,8 @@ export default function WorkspaceSettingsPage() {
         name: editName,
         default_currency: editCurrency,
         locale: editLocale || (null as unknown as string),
+        tax_jurisdiction: editJurisdiction || null,
+        timezone: editTimezone || null,
         icon: editIcon,
         color: editColor,
       })
@@ -177,7 +222,7 @@ export default function WorkspaceSettingsPage() {
       return workspacesApi.invite(current.id, {
         email: inviteEmail.trim(),
         role: inviteRole,
-        password: invitePassword || undefined,
+        password: localAuthEnabled ? (invitePassword || undefined) : undefined,
       })
     },
     onSuccess: () => {
@@ -246,6 +291,7 @@ export default function WorkspaceSettingsPage() {
   const stats = statsQuery.data ?? { members: 1, accounts: 0, transactions: 0 }
   const isManaged = !!current.managed_by_user_id
   const isManagerSelf = isManaged && current.managed_by_user_id === currentUser?.id
+  const kindLabelKey = WORKSPACE_KIND_LABEL_KEY[current.kind as WorkspaceKind]
 
   return (
     <div className="container max-w-5xl py-8 space-y-6">
@@ -261,6 +307,12 @@ export default function WorkspaceSettingsPage() {
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-semibold truncate">{current.name}</h1>
+              {/* Fixed at creation, so it reads as identity, not a control. */}
+              {kindLabelKey && (
+                <Badge variant="outline" className="text-[11px]">
+                  {t(kindLabelKey)}
+                </Badge>
+              )}
               {current.role && (
                 <Badge variant="secondary" className="text-[11px]">
                   {labelForRole(current.role, t)}
@@ -298,7 +350,7 @@ export default function WorkspaceSettingsPage() {
               className="rounded-lg"
               size="sm"
             >
-              <Save className="mr-2 h-4 w-4" />
+              <Save className="me-2 h-4 w-4" />
               {updateMutation.isPending ? t('common.loading') : t('common.save')}
             </Button>
           )}
@@ -312,14 +364,14 @@ export default function WorkspaceSettingsPage() {
               <>
                 <div className="space-y-1.5">
                   <Label className="text-[13px]">
-                    {t('workspace.icon', 'Ícone')}
+                    {t('workspace.icon', 'Icon')}
                   </Label>
                   <Popover>
                     <PopoverTrigger asChild>
                       <button
                         type="button"
                         className="h-10 w-10 rounded-lg border border-input flex items-center justify-center hover:bg-muted/40 transition-colors shrink-0"
-                        title={t('workspace.icon', 'Ícone')}
+                        title={t('workspace.icon', 'Icon')}
                       >
                         <CategoryIcon icon={editIcon} color={editColor} size="sm" />
                       </button>
@@ -331,15 +383,15 @@ export default function WorkspaceSettingsPage() {
                 </div>
                 <div className="space-y-1.5">
                   <Label htmlFor="ws-color" className="text-[13px]">
-                    {t('groups.color', 'Cor')}
+                    {t('groups.color', 'Color')}
                   </Label>
                   <input
                     id="ws-color"
                     type="color"
                     value={editColor}
                     onChange={(e) => setEditColor(e.target.value)}
-                    className="h-10 w-10 p-1 rounded-lg cursor-pointer border border-input bg-background shrink-0"
-                    title={t('groups.color', 'Cor')}
+                    className="h-10 w-10 p-1 rounded-lg cursor-pointer border border-input bg-card shrink-0"
+                    title={t('groups.color', 'Color')}
                   />
                 </div>
               </>
@@ -363,8 +415,8 @@ export default function WorkspaceSettingsPage() {
             </div>
           </div>
 
-          {/* Region row — currency + locale */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {/* Region row — currency, language, and where the workspace files */}
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="ws-currency" className="text-[13px]">
                 {t('workspace.defaultCurrency')}
@@ -380,7 +432,7 @@ export default function WorkspaceSettingsPage() {
                 <SelectContent>
                   {(supportedCurrencies ?? [{ code: editCurrency, symbol: editCurrency, name: editCurrency, flag: '' }]).map((c) => (
                     <SelectItem key={c.code} value={c.code}>
-                      <span className="mr-2">{c.flag}</span>
+                      <span className="me-2">{c.flag}</span>
                       {c.name}
                     </SelectItem>
                   ))}
@@ -401,17 +453,57 @@ export default function WorkspaceSettingsPage() {
                 </SelectTrigger>
                 <SelectContent>
                   <SelectItem value="__none__">—</SelectItem>
-                  <SelectItem value="ru">Русский</SelectItem>
-                  <SelectItem value="de">Deutsch</SelectItem>
-                  <SelectItem value="uk">Українська</SelectItem>
-                  <SelectItem value="en">English</SelectItem>
-                  <SelectItem value="pt-BR">Português (BR)</SelectItem>
-                  <SelectItem value="es">Español</SelectItem>
-                  <SelectItem value="pl">Polski</SelectItem>
-                  <SelectItem value="it">Italiano</SelectItem>
-                  <SelectItem value="fr">Français</SelectItem>
+                  {SUPPORTED_LANGS.map(({ code, label }) => (
+                    <SelectItem key={code} value={code}>{label}</SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="ws-jurisdiction" className="text-[13px]">
+                {t('workspace.taxJurisdiction', 'Tax jurisdiction')}
+              </Label>
+              <Select
+                value={editJurisdiction || '__none__'}
+                onValueChange={(v) => setEditJurisdiction(v === '__none__' ? '' : v)}
+                disabled={!canManage}
+              >
+                <SelectTrigger id="ws-jurisdiction" className="h-10 rounded-lg w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">—</SelectItem>
+                  {sortedJurisdictions.map((code) => (
+                    <SelectItem key={code} value={code}>
+                      <span className="me-2">{countryFlag(code)}</span>
+                      {countryName(code, i18n.language)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                {t(
+                  'workspace.taxJurisdictionHint',
+                  'Decides which fiscal documents this workspace is offered. Separate from the interface language.',
+                )}
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="ws-timezone" className="text-[13px]">
+                {t('workspace.timezone')}
+              </Label>
+              <TimezoneSelect
+                id="ws-timezone"
+                className="h-10 rounded-lg w-full"
+                value={editTimezone}
+                onChange={setEditTimezone}
+                options={timezoneOptions?.available ?? (editTimezone ? [editTimezone] : [])}
+                emptyOption={t('workspace.timezoneDefault', { zone: timezoneOptions?.default ?? 'UTC' })}
+                disabled={!canManage}
+              />
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                {t('workspace.timezoneHint')}
+              </p>
             </div>
           </div>
         </div>
@@ -429,7 +521,7 @@ export default function WorkspaceSettingsPage() {
           </div>
           {canManage && (
             <Button onClick={() => setInviteOpen(true)} size="sm" className="rounded-lg">
-              <Plus className="mr-2 h-4 w-4" />
+              <Plus className="me-2 h-4 w-4" />
               {t('workspace.addMember')}
             </Button>
           )}
@@ -459,7 +551,7 @@ export default function WorkspaceSettingsPage() {
                     <p className="text-sm font-medium truncate">
                       {m.display_name || m.email}
                       {isMe && (
-                        <span className="ml-2 text-xs text-muted-foreground">
+                        <span className="ms-2 text-xs text-muted-foreground">
                           ({t('workspace.you')})
                         </span>
                       )}
@@ -477,7 +569,7 @@ export default function WorkspaceSettingsPage() {
                           role: e.target.value as WorkspaceRole,
                         })
                       }
-                      className="h-9 w-32 rounded-lg border border-input bg-background px-2 text-sm"
+                      className="h-9 w-32 rounded-lg border border-input bg-card px-2 text-sm"
                     >
                       {(['owner', 'editor', 'viewer'] as WorkspaceRole[]).map((r) => (
                         <option key={r} value={r}>
@@ -508,6 +600,13 @@ export default function WorkspaceSettingsPage() {
         )}
       </section>
 
+      {/* Accountant export: the business workspace's books, for the period
+          the user picks. Any member may export; the server refuses other
+          workspace kinds. */}
+      {current.kind === 'business' && <AccountantExportSection />}
+
+      {pluginsEnabled && <PluginsSection />}
+
       {/* Danger zone — owners only */}
       {canManage && (
         <section className="space-y-4 rounded-xl border bg-card p-6">
@@ -537,7 +636,7 @@ export default function WorkspaceSettingsPage() {
               className="rounded-lg text-destructive hover:bg-destructive/10 hover:text-destructive"
               onClick={() => setArchiveOpen(true)}
             >
-              <Archive className="mr-2 h-4 w-4" />
+              <Archive className="me-2 h-4 w-4" />
               {t('workspace.archive', 'Arquivar')}
             </Button>
           </div>
@@ -549,7 +648,13 @@ export default function WorkspaceSettingsPage() {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{t('workspace.addMemberTitle')}</DialogTitle>
-            <DialogDescription>{t('workspace.addMemberDescription')}</DialogDescription>
+            <DialogDescription>
+              {t(
+                localAuthEnabled
+                  ? 'workspace.addMemberDescription'
+                  : 'workspace.addMemberDescriptionExistingOnly',
+              )}
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-1">
             <div className="space-y-1.5">
@@ -574,7 +679,7 @@ export default function WorkspaceSettingsPage() {
                 id="invite-role"
                 value={inviteRole}
                 onChange={(e) => setInviteRole(e.target.value as WorkspaceRole)}
-                className="w-full h-10 rounded-lg border border-input bg-background px-3 text-sm"
+                className="w-full h-10 rounded-lg border border-input bg-card px-3 text-sm"
               >
                 {(['owner', 'editor', 'viewer'] as WorkspaceRole[]).map((r) => (
                   <option key={r} value={r}>
@@ -583,22 +688,24 @@ export default function WorkspaceSettingsPage() {
                 ))}
               </select>
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="invite-password" className="text-[13px]">
-                {t('workspace.passwordForNewUsers')}
-              </Label>
-              <Input
-                id="invite-password"
-                type="password"
-                value={invitePassword}
-                onChange={(e) => setInvitePassword(e.target.value)}
-                className="h-10 rounded-lg"
-                placeholder=""
-              />
-              <p className="text-[11px] text-muted-foreground leading-relaxed">
-                {t('workspace.passwordHint')}
-              </p>
-            </div>
+            {localAuthEnabled && (
+              <div className="space-y-1.5">
+                <Label htmlFor="invite-password" className="text-[13px]">
+                  {t('workspace.passwordForNewUsers')}
+                </Label>
+                <Input
+                  id="invite-password"
+                  type="password"
+                  value={invitePassword}
+                  onChange={(e) => setInvitePassword(e.target.value)}
+                  className="h-10 rounded-lg"
+                  placeholder=""
+                />
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  {t('workspace.passwordHint')}
+                </p>
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button
@@ -680,7 +787,7 @@ export default function WorkspaceSettingsPage() {
               disabled={archiveMutation.isPending}
               className="rounded-lg"
             >
-              <Archive className="mr-2 h-4 w-4" />
+              <Archive className="me-2 h-4 w-4" />
               {archiveMutation.isPending ? t('common.loading') : t('workspace.archive', 'Arquivar')}
             </Button>
           </DialogFooter>

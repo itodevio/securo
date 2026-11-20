@@ -6,6 +6,8 @@ dashboard) just check that the wrapper returns a serializable shape, not
 the full numeric correctness of those services.
 """
 import uuid
+from datetime import date, timedelta
+from decimal import Decimal
 
 import pytest
 import pytest_asyncio
@@ -13,15 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # Importing this package registers all tools into mcp_server.registry.REGISTRY.
 import mcp_server.tools  # noqa: F401
+from app.models.account import Account
+from app.models.transaction import Transaction
+from app.schemas.account import AccountCreate
+from app.services import account_service
 from mcp_server.auth import CallContext
 from mcp_server.registry import REGISTRY
 
 
-pytestmark = pytest.mark.asyncio
-
-
 @pytest_asyncio.fixture
-def ctx(test_user) -> CallContext:
+async def ctx(test_user) -> CallContext:
     return CallContext(user_id=test_user.id, conversation_id=uuid.uuid4())
 
 
@@ -48,10 +51,14 @@ def test_registry_contains_v1_tools():
         "propose_create_budget",
         "propose_create_payee_rule",
         "propose_create_transaction",
+        "propose_update_transaction",
         "propose_create_recurring_transaction",
         "propose_update_recurring_transaction",
         "propose_cancel_recurring_transaction",
         "propose_create_goal",
+        "propose_update_payee",
+        "propose_merge_payees",
+        "propose_create_payee",
         "search_knowledge_base",
         "list_recurring_transactions",
         "list_assets",
@@ -63,7 +70,15 @@ def test_registry_contains_v1_tools():
 
 
 def test_proposal_tools_marked_is_proposal():
-    for name in ("propose_categorize", "propose_create_category", "propose_create_budget", "propose_create_payee_rule"):
+    for name in (
+        "propose_categorize",
+        "propose_create_category",
+        "propose_create_budget",
+        "propose_create_payee_rule",
+        "propose_update_payee",
+        "propose_merge_payees",
+        "propose_create_payee",
+    ):
         spec = REGISTRY[name]
         assert spec.is_proposal, f"{name} should have is_proposal=True"
 
@@ -72,6 +87,21 @@ def test_each_tool_has_input_schema():
     for name, spec in REGISTRY.items():
         assert spec.parameters.get("type") == "object", f"{name} schema must be object"
         assert "properties" in spec.parameters
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "propose_create_recurring_transaction",
+        "propose_update_recurring_transaction",
+    ],
+    ids=["create", "update"],
+)
+def test_recurring_proposal_frequency_schema_includes_new_values(tool_name):
+    advertised = set(
+        REGISTRY[tool_name].parameters["properties"]["frequency"]["enum"]
+    )
+    assert {"biweekly", "semiannual"} <= advertised
 
 
 # --- Read tools (with real seeded data) -----------------------------------
@@ -143,13 +173,12 @@ async def test_list_transactions_tx_type_filter(
 async def test_list_transactions_currency_filter_matches_native(
     session: AsyncSession, ctx: CallContext, test_transactions
 ):
-    """The Transaction.currency column defaults to USD in the fixture
-    (independent of the account's BRL currency), so 'USD' should return
+    """The fixture rows carry the account's currency, so 'BRL' should return
     everything and any narrower filter returns ≤ that count."""
     handler = REGISTRY["list_transactions"].handler
-    usd = await handler(session=session, ctx=ctx, currency="USD")
-    assert usd["total"] >= 1
-    assert all(x["currency"] == "USD" for x in usd["items"])
+    brl = await handler(session=session, ctx=ctx, currency="BRL")
+    assert brl["total"] >= 1
+    assert all(x["currency"] == "BRL" for x in brl["items"])
 
 
 async def test_list_transactions_currency_filter_returns_zero_for_unused(
@@ -168,8 +197,11 @@ async def test_list_transactions_currency_filter_is_case_insensitive(
     session: AsyncSession, ctx: CallContext, test_transactions
 ):
     handler = REGISTRY["list_transactions"].handler
-    a = await handler(session=session, ctx=ctx, currency="usd")
-    b = await handler(session=session, ctx=ctx, currency="USD")
+    a = await handler(session=session, ctx=ctx, currency="brl")
+    b = await handler(session=session, ctx=ctx, currency="BRL")
+    # Against the BRL fixture rows a nonempty result is what proves the
+    # match stayed case-insensitive; two empty results would prove nothing.
+    assert a["total"] >= 1
     assert a["total"] == b["total"]
 
 
@@ -207,6 +239,58 @@ async def test_list_recurring_transactions_returns_empty_dict_with_no_data(
     handler = REGISTRY["list_recurring_transactions"].handler
     r = await handler(session=session, ctx=ctx)
     assert r == {"items": [], "total": 0}
+
+
+async def test_list_accounts_reports_current_balance(
+    session: AsyncSession, ctx: CallContext, test_user, test_account, test_connection
+):
+    """A manual account's balance is its opening balance plus its
+    transactions, as on the Accounts page, not the stored opening amount."""
+    ws_id = test_account.workspace_id
+    manual = await account_service.create_account(
+        session,
+        ws_id,
+        test_user.id,
+        AccountCreate(name="Manual", type="checking", balance=Decimal("100.00"), currency="BRL"),
+    )
+    for amount, tx_type in (("50.00", "credit"), ("20.00", "debit")):
+        session.add(
+            Transaction(
+                id=uuid.uuid4(),
+                user_id=test_user.id,
+                workspace_id=ws_id,
+                account_id=manual.id,
+                description=f"Seeded {tx_type}",
+                amount=Decimal(amount),
+                date=date.today() - timedelta(days=1),
+                type=tx_type,
+                source="manual",
+                currency="BRL",
+            )
+        )
+    session.add(
+        Account(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            workspace_id=ws_id,
+            connection_id=test_connection.id,
+            external_id="card-ext-1",
+            name="Connected Card",
+            type="credit_card",
+            balance=Decimal("300.00"),
+            currency="BRL",
+        )
+    )
+    await session.commit()
+
+    handler = REGISTRY["list_accounts"].handler
+    r = await handler(session=session, ctx=ctx)
+    balances = {item["name"]: item["balance"] for item in r["items"]}
+    assert balances["Manual"] == pytest.approx(130.00)
+    # A connected account reports what the bank sent, as before.
+    assert balances["Conta Corrente"] == pytest.approx(1500.00)
+    # A card is debt, so it comes back negative, as on the Accounts page.
+    assert balances["Connected Card"] == pytest.approx(-300.00)
 
 
 async def test_list_assets_empty(session: AsyncSession, ctx: CallContext):
@@ -250,6 +334,54 @@ async def test_aggregate_currency_filter(
     assert "error" not in eur and eur["items"] == []
 
 
+async def test_aggregate_exclude_transfers_drops_treat_as_transfer_categories(
+    session: AsyncSession, ctx: CallContext, test_user, test_account
+):
+    """exclude_transfers leaves out rows in a treat_as_transfer category, not
+    only paired legs, and still keeps uncategorized rows (#1342)."""
+    from datetime import date, datetime, timezone
+    from decimal import Decimal
+
+    from app.models.category import Category
+    from app.models.transaction import Transaction
+
+    investing = Category(
+        id=uuid.uuid4(), user_id=test_user.id, name="Investing",
+        icon="tag", color="#000", is_system=False, treat_as_transfer=True,
+    )
+    groceries = Category(
+        id=uuid.uuid4(), user_id=test_user.id, name="Groceries",
+        icon="tag", color="#000", is_system=False,
+    )
+    session.add_all([investing, groceries])
+    await session.commit()
+
+    def tx(amount: str, category_id=None, transfer_pair_id=None) -> Transaction:
+        return Transaction(
+            id=uuid.uuid4(), user_id=test_user.id, account_id=test_account.id,
+            category_id=category_id, transfer_pair_id=transfer_pair_id,
+            description="row", amount=Decimal(amount), date=date(2026, 3, 10),
+            type="debit", source="manual", created_at=datetime.now(timezone.utc),
+        )
+
+    session.add_all([
+        tx("500", investing.id),  # unpaired, in a treat_as_transfer category
+        tx("40", groceries.id),
+        tx("15"),  # uncategorized
+        tx("200", transfer_pair_id=uuid.uuid4()),  # paired leg
+    ])
+    await session.commit()
+
+    handler = REGISTRY["aggregate"].handler
+    period = {"from_date": "2026-03-01", "to_date": "2026-03-31", "group_by": "account"}
+
+    excluded = await handler(session=session, ctx=ctx, exclude_transfers=True, **period)
+    assert [(i["value"], i["count"]) for i in excluded["items"]] == [(55.0, 2)]
+
+    included = await handler(session=session, ctx=ctx, exclude_transfers=False, **period)
+    assert [(i["value"], i["count"]) for i in included["items"]] == [(755.0, 4)]
+
+
 async def test_list_transactions_account_types_filter(
     session: AsyncSession, ctx: CallContext, test_transactions, test_account
 ):
@@ -273,9 +405,27 @@ async def test_list_accounts(session: AsyncSession, ctx: CallContext, test_accou
 async def test_get_account_summary(session: AsyncSession, ctx: CallContext, test_account, test_transactions):
     handler = REGISTRY["get_account_summary"].handler
     result = await handler(session=session, ctx=ctx, account_id=str(test_account.id))
-    # Real service returns a dict with income/expense/etc. We just verify it's not an error.
     assert isinstance(result, dict)
     assert "error" not in result or result.get("error") is None
+    assert set(result) == {
+        "account_id",
+        "current_balance",
+        "opening_balance",
+        "monthly_income",
+        "monthly_expenses",
+        "projected_income",
+        "projected_expenses",
+    }
+    income = float(sum(t.amount for t in test_transactions if t.type == "credit"))
+    expenses = float(sum(t.amount for t in test_transactions if t.type == "debit"))
+    current_balance = float(test_account.balance)
+    assert result["account_id"] == str(test_account.id)
+    assert result["current_balance"] == pytest.approx(current_balance)
+    assert result["opening_balance"] == pytest.approx(current_balance - (income - expenses))
+    assert result["monthly_income"] == pytest.approx(income)
+    assert result["monthly_expenses"] == pytest.approx(expenses)
+    assert result["projected_income"] == pytest.approx(income)
+    assert result["projected_expenses"] == pytest.approx(expenses)
 
 
 async def test_get_account_summary_unknown_account(session: AsyncSession, ctx: CallContext):
@@ -323,18 +473,6 @@ async def test_aggregate_by_category(
     # We have UBER (Transporte) and IFOOD (Alimentação) as expenses.
     labels = {item.get("label") for item in result["items"]}
     assert "Transporte" in labels or "Alimentação" in labels
-
-
-@pytest.mark.skip(reason="aggregate by month uses PostgreSQL to_char, not portable to SQLite test DB")
-async def test_aggregate_by_month(
-    session: AsyncSession, ctx: CallContext, test_transactions
-):
-    handler = REGISTRY["aggregate"].handler
-    result = await handler(session=session, ctx=ctx, metric="count", group_by="month")
-    assert "items" in result
-    for item in result["items"]:
-        if item["bucket"]:
-            assert len(item["bucket"]) == 7 and item["bucket"][4] == "-"
 
 
 async def test_aggregate_unknown_group_by(session: AsyncSession, ctx: CallContext):
@@ -402,6 +540,16 @@ async def test_propose_create_category_no_collision(
     assert result["proposed"]["name"] == "UniqueNewCategoryX9Z"
 
 
+async def test_propose_create_category_wildcard_name_is_no_collision(
+    session: AsyncSession, ctx: CallContext, test_categories
+):
+    handler = REGISTRY["propose_create_category"].handler
+    # Unescaped, `%` would match every category and `_` any one character.
+    for name in ("%", "_" * len(test_categories[0].name)):
+        result = await handler(session=session, ctx=ctx, name=name)
+        assert result["name_collision"] is None, name
+
+
 async def test_propose_create_budget(
     session: AsyncSession, ctx: CallContext, test_categories
 ):
@@ -464,6 +612,22 @@ async def test_propose_create_recurring_monthly_requires_day(
     assert "day_of_month" in r.get("error", "")
 
 
+async def test_propose_create_recurring_semiannual_requires_day(
+    session: AsyncSession, ctx: CallContext, test_account
+):
+    handler = REGISTRY["propose_create_recurring_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        description="Insurance",
+        amount=600.0,
+        type="debit",
+        frequency="semiannual",
+        account_id=str(test_account.id),
+    )
+    assert "day_of_month" in result.get("error", "")
+
+
 async def test_propose_create_recurring_monthly_full(
     session: AsyncSession, ctx: CallContext, test_account
 ):
@@ -472,11 +636,13 @@ async def test_propose_create_recurring_monthly_full(
         session=session, ctx=ctx,
         description="Netflix", amount=55.0, type="debit",
         frequency="monthly", day_of_month=10,
+        weekend_adjustment="previous_friday",
         account_id=str(test_account.id),
     )
     assert r["kind"] == "create_recurring_transaction"
     assert r["proposed"]["day_of_month"] == 10
     assert r["proposed"]["frequency"] == "monthly"
+    assert r["proposed"]["weekend_adjustment"] == "previous_friday"
 
 
 async def test_propose_update_recurring_no_changes(
@@ -827,6 +993,7 @@ async def test_propose_create_recurring_transaction_external_apply_writes(
         frequency="monthly",
         day_of_month=10,
         account_id=str(test_account.id),
+        weekend_adjustment="next_monday",
         apply=True,
     )
     assert result.get("applied") is True
@@ -839,6 +1006,7 @@ async def test_propose_create_recurring_transaction_external_apply_writes(
     assert row.description == "Netflix"
     assert row.frequency == "monthly"
     assert row.day_of_month == 10
+    assert row.weekend_adjustment == "next_monday"
 
 
 async def test_propose_update_recurring_transaction_external_apply_writes(
@@ -873,12 +1041,14 @@ async def test_propose_update_recurring_transaction_external_apply_writes(
         session=session, ctx=ctx,
         recurring_id=str(rt.id),
         amount=27.90,
+        weekend_adjustment="previous_friday",
         apply=True,
     )
     assert result.get("applied") is True
 
     await session.refresh(rt)
     assert float(rt.amount) == 27.90
+    assert rt.weekend_adjustment == "previous_friday"
 
 
 async def test_propose_cancel_recurring_transaction_deactivate_apply(

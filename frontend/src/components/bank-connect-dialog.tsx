@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useEffectEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useQueryClient } from '@tanstack/react-query'
 import { PluggyConnect } from 'react-pluggy-connect'
 import { connections } from '@/lib/api'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
+import type { BankConnection } from '@/types'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -40,6 +41,11 @@ export function BankConnectDialog({
   // Only prompt for asset-sync when the provider actually imports holdings.
   const needsInitialOptions = !reconnectConnectionId && supportsAssetSync
 
+  const onTokenError = useEffectEvent(() => {
+    toast.error(t('accounts.connectError'))
+    onClose()
+  })
+
   useEffect(() => {
     if (!open) {
       setConnectToken(null)
@@ -59,8 +65,7 @@ export function BankConnectDialog({
         if (!cancelled) setConnectToken(token)
       } catch {
         if (!cancelled) {
-          toast.error(t('accounts.connectError'))
-          onClose()
+          onTokenError()
         }
       }
     }
@@ -71,10 +76,14 @@ export function BankConnectDialog({
 
   const handleSuccess = async (data: { item: { id: string } }) => {
     try {
+      let connection: BankConnection | null = null
       if (reconnectConnectionId) {
+        // The callback stores the item again and marks the connection active,
+        // which a connection that was disconnected needs before it can sync.
+        await connections.handleCallback(data.item.id, provider, undefined, undefined, reconnectConnectionId)
         await connections.sync(reconnectConnectionId)
       } else {
-        await connections.handleCallback(
+        connection = await connections.handleCallback(
           data.item.id,
           provider,
           undefined,
@@ -82,11 +91,19 @@ export function BankConnectDialog({
         )
       }
       invalidateFinancialQueries(queryClient)
-      queryClient.invalidateQueries({ queryKey: ['connections'] })
-      toast.success(t('accounts.connected'))
+      if (connection?.status === 'error') {
+        // The bank is connected; only the first import was refused. The
+        // connection card retries it with the credentials already stored.
+        toast.warning(t('accounts.connectedImportFailed'))
+      } else {
+        toast.success(t('accounts.connected'))
+      }
     } catch {
       toast.error(t('accounts.connectError'))
     } finally {
+      // Also after a failure: the callback may have reactivated the
+      // connection before the sync failed, and the list must show that.
+      queryClient.invalidateQueries({ queryKey: ['connections'] })
       handleClose()
     }
   }

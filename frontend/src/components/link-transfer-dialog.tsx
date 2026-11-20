@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { getAccountName } from '@/lib/account-utils'
+import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
 import { useQuery } from '@tanstack/react-query'
@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -15,10 +16,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ArrowRight, AlertTriangle, Info, ArrowLeft, Search, Sparkles } from 'lucide-react'
 import { transactions as transactionsApi } from '@/lib/api'
 import type { Account, Transaction } from '@/types'
-
-function formatCurrency(value: number, currency = 'USD', locale = 'en-US') {
-  return new Intl.NumberFormat(locale, { style: 'currency', currency }).format(value)
-}
+import { formatCurrency } from '@/lib/format'
 
 type CounterpartCardProps = {
   label: string
@@ -35,7 +33,7 @@ type CounterpartCardProps = {
 function CounterpartCard({ label, description, account, date, amount, currency, sign, locale, dateLocale }: CounterpartCardProps) {
   const colorClass = sign === '+' ? 'text-emerald-600' : 'text-rose-500'
   return (
-    <div className="rounded-lg border border-border bg-muted/30 p-3">
+    <div className="min-w-0 rounded-lg border border-border bg-muted/30 p-3">
       <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground mb-1">
         {label}
       </p>
@@ -47,8 +45,10 @@ function CounterpartCard({ label, description, account, date, amount, currency, 
         {new Date(date + 'T00:00:00').toLocaleDateString(dateLocale)}{/* date order from setting, words from app language */}
       </p>
       <p className={`text-sm font-bold tabular-nums ${colorClass} mt-2`}>
-        {sign}
-        {formatCurrency(amount, currency, locale)}
+        <span dir="ltr">
+          {sign}
+          {formatCurrency(amount, currency, locale)}
+        </span>
       </p>
     </div>
   )
@@ -160,21 +160,21 @@ export function LinkTransferDialog({
     // Manual accounts (no bank connection) where we can auto-create the
     // counterpart, since a synced account would already have a real
     // transaction showing in the candidates list above.
-    const manualCounterpartAccounts = accounts.filter(
-      (a) => a.connection_id == null && a.id !== anchor!.account_id,
+    const manualCounterpartAccounts = sortAccountsByDisplayName(
+      accounts.filter((a) => a.connection_id == null && a.id !== anchor!.account_id),
     )
 
     return (
       <Dialog open={open} onOpenChange={onClose}>
-        <DialogContent className="sm:max-w-xl overflow-hidden">
+        <DialogContent className="max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden p-4 sm:max-w-xl sm:p-6">
           <DialogHeader>
             <DialogTitle>{t('transactions.linkTransferPickerTitle')}</DialogTitle>
           </DialogHeader>
 
-          <div className="space-y-4 min-w-0">
-            <p className="text-sm text-muted-foreground">
+          <div className="min-h-0 min-w-0 space-y-4 overflow-y-auto overscroll-contain pe-1">
+            <DialogDescription>
               {t('transactions.linkTransferPickerDescription')}
-            </p>
+            </DialogDescription>
 
             <CounterpartCard
               label={t('transactions.linkTransferAnchor')}
@@ -189,13 +189,13 @@ export function LinkTransferDialog({
             />
 
             <div className="relative">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Search size={14} className="absolute start-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
               <input
                 type="text"
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder={t('transactions.linkTransferSearchPlaceholder')}
-                className="w-full pl-9 pr-3 py-2 text-sm rounded-md border border-border bg-card text-foreground focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]"
+                className="w-full ps-9 pe-3 py-2 text-sm rounded-md border border-border bg-card text-foreground focus:outline-none focus-visible:ring-ring/30 focus-visible:ring-[2px]"
               />
             </div>
 
@@ -226,7 +226,7 @@ export function LinkTransferDialog({
                         <button
                           type="button"
                           onClick={() => setPickedCandidate(c)}
-                          className="w-full text-left rounded-lg border border-border bg-card hover:bg-muted/50 hover:border-primary/40 transition-colors p-3 flex items-center gap-3 min-w-0"
+                          className="w-full text-start rounded-lg border border-border bg-card hover:bg-muted/50 hover:border-primary/40 transition-colors p-3 flex items-center gap-3 min-w-0"
                         >
                           <div className="min-w-0 flex-1">
                             <div className="flex items-center gap-2 min-w-0">
@@ -245,8 +245,10 @@ export function LinkTransferDialog({
                             </p>
                           </div>
                           <p className={`text-sm font-bold tabular-nums ${colorClass} shrink-0`}>
-                            {sign}
-                            {formatCurrency(amount, c.currency, locale)}
+                            <span dir="ltr">
+                              {sign}
+                              {formatCurrency(amount, c.currency, locale)}
+                            </span>
                           </p>
                         </button>
                       </li>
@@ -291,7 +293,7 @@ export function LinkTransferDialog({
             )}
           </div>
 
-          <DialogFooter>
+          <DialogFooter className="shrink-0">
             <Button type="button" variant="outline" onClick={onClose} disabled={loading}>
               {t('common.cancel')}
             </Button>
@@ -313,17 +315,17 @@ export function LinkTransferDialog({
 
   return (
     <Dialog open={open} onOpenChange={onClose}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden p-4 sm:max-w-lg sm:p-6">
         <DialogHeader>
           <DialogTitle>{t('transactions.linkTransferTitle')}</DialogTitle>
         </DialogHeader>
 
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
+        <div className="min-h-0 space-y-4 overflow-y-auto overscroll-contain pe-1">
+          <DialogDescription>
             {t('transactions.linkTransferDescription')}
-          </p>
+          </DialogDescription>
 
-          <div className="grid grid-cols-[1fr_auto_1fr] items-stretch gap-3">
+          <div className="grid grid-cols-1 items-stretch gap-2 sm:grid-cols-[1fr_auto_1fr] sm:gap-3">
             <CounterpartCard
               label={t('transactions.linkTransferFrom')}
               description={effectiveDebit.description}
@@ -335,8 +337,8 @@ export function LinkTransferDialog({
               locale={locale}
               dateLocale={dateLocale}
             />
-            <div className="flex items-center">
-              <ArrowRight size={18} className="text-muted-foreground" />
+            <div className="flex items-center justify-center">
+              <ArrowRight size={18} className="rtl-no-flip rotate-90 text-muted-foreground sm:rotate-0 rtl:sm:rotate-180" />
             </div>
             <CounterpartCard
               label={t('transactions.linkTransferTo')}
@@ -364,16 +366,16 @@ export function LinkTransferDialog({
           </div>
         </div>
 
-        <DialogFooter className="gap-2 sm:gap-2">
+        <DialogFooter className="shrink-0 gap-2 sm:gap-2">
           {isPickerMode && (
             <Button
               type="button"
               variant="ghost"
               onClick={() => setPickedCandidate(null)}
               disabled={loading}
-              className="mr-auto"
+              className="me-auto"
             >
-              <ArrowLeft size={14} className="mr-1" />
+              <ArrowLeft size={14} className="me-1" />
               {t('transactions.linkTransferBack')}
             </Button>
           )}

@@ -1,11 +1,17 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
-import './lib/i18n'
+import { i18nReady } from './lib/i18n'
 import App from './App.tsx'
+import { reloadOnStaleChunk } from './lib/reload-on-stale-chunk'
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
+reloadOnStaleChunk()
+
+// Honour a persisted language before rendering any translated UI.
+void i18nReady.then(() => {
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+    </StrictMode>,
+  )
+})

@@ -1,4 +1,7 @@
 import asyncio
+import calendar
+import hashlib
+import json
 import logging
 import time
 from datetime import date
@@ -17,6 +20,7 @@ from app.providers.base import (
     ConnectTokenData,
     HoldingData,
     RefreshOutcome,
+    ReservedBalanceData,
     TransactionData,
     mask_last4,
 )
@@ -65,6 +69,120 @@ def _compe_from_transfer_number(transfer_number) -> Optional[str]:
     return code.zfill(3) if code.isdigit() else None
 
 
+def _add_months(d: date, months: int) -> date:
+    """Advance a date by N months, clamping the day to the target month's length."""
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    return date(year, month, min(d.day, calendar.monthrange(year, month)[1]))
+
+
+# Public, community-maintained mirror of the Bacen (Central Bank) COMPE
+# participant registry — free, no API key, no rate limits seen in practice.
+# https://brasilapi.com.br/api/banks/v1/{code}
+BRASIL_API_BANKS_URL = "https://brasilapi.com.br/api/banks/v1"
+_BANK_INFO_CACHE_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days — COMPE codes are static
+
+
+async def _lookup_bank_info(compe: str) -> Optional[dict]:
+    """Best-effort ``{"name", "logo_url"}`` for a COMPE code via BrasilAPI.
+
+    Cached in Redis since a bank's registered name/logo effectively never
+    change. A lookup failure (network, cache, anything) must never break
+    sync — it just means the affected accounts fall back to the connection's
+    own institution fields, same as any Pluggy connection without this hint.
+
+    Gated by ``brasilapi_institution_lookup_enabled``: this is the only place
+    a COMPE code leaves the server, so deploys must opt in before any call
+    to BrasilAPI is made.
+    """
+    if not get_settings().brasilapi_institution_lookup_enabled:
+        return None
+
+    from app.core.redis import get_redis
+
+    cache_key = f"pluggy:bank_info:{compe}"
+    redis_client = None
+    try:
+        redis_client = await get_redis()
+        cached = await redis_client.get(cache_key)
+        if cached is not None:
+            return json.loads(cached) if cached else None
+    except Exception:
+        redis_client = None
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{BRASIL_API_BANKS_URL}/{int(compe)}")
+            resp.raise_for_status()
+            payload = resp.json()
+            # `name` (e.g. "BCO XP S.A.") is short, matching the style Pluggy
+            # itself uses for account names — `fullName` is the full legal
+            # razão social and too long for an institution label.
+            name = payload.get("name") or None
+            logo_url = payload.get("logo_url") or None
+            info = {"name": name, "logo_url": logo_url} if name else None
+    except Exception:
+        logger.warning(
+            "BrasilAPI bank-info lookup failed for COMPE %s", compe, exc_info=True
+        )
+        return None
+
+    if redis_client is not None:
+        try:
+            await redis_client.set(
+                cache_key, json.dumps(info) if info else "", ex=_BANK_INFO_CACHE_TTL_SECONDS
+            )
+        except Exception:
+            pass
+    return info
+
+
+async def _annotate_institutions(
+    raw_accounts: list[dict], accounts: list[AccountData]
+) -> None:
+    """Tell apart same-subtype accounts that belong to different legal
+    institutions under one Pluggy connection.
+
+    Pluggy is normally one institution per connection, but a banking group
+    with a brokerage arm (e.g. XP) reports both the bank's checking account
+    and the brokerage's settlement account as BANK/CHECKING_ACCOUNT — same
+    `type`, no field distinguishes them except the COMPE code embedded in
+    `bankData.transferNumber`. When every account of a given `type` in this
+    connection shares one COMPE code (the common case: one checking + one
+    savings, same bank), nothing is ambiguous and no account is touched.
+    Only when a `type` collides across more than one COMPE code do we
+    resolve and set the institution_* hint fields — which `_resolve_institution`
+    (connection_service.py) turns into an `Institution` row, same mechanism
+    SimpleFIN already uses for its own multi-institution connections
+    (issue #345).
+    """
+    codes_by_external_id: dict[str, str] = {}
+    codes_by_type: dict[str, set[str]] = {}
+    for raw, acc in zip(raw_accounts, accounts):
+        code = _compe_from_transfer_number((raw.get("bankData") or {}).get("transferNumber"))
+        if not code:
+            continue
+        codes_by_external_id[acc.external_id] = code
+        codes_by_type.setdefault(acc.type, set()).add(code)
+
+    ambiguous_types = {t for t, codes in codes_by_type.items() if len(codes) > 1}
+    if not ambiguous_types:
+        return
+
+    for acc in accounts:
+        if acc.type not in ambiguous_types:
+            continue
+        code = codes_by_external_id.get(acc.external_id)
+        if not code:
+            continue
+        info = await _lookup_bank_info(code)
+        if info:
+            acc.institution_external_id = code
+            acc.institution_name = info["name"]
+            acc.institution_logo_url = info["logo_url"]
+
+
 def _resolve_connector_logo(connector: dict, accounts: list[dict]) -> Optional[str]:
     """Institution logo URL for a Pluggy connection, or None.
 
@@ -104,6 +222,40 @@ def _decimal_or_none(value) -> Optional[Decimal]:
         return None
 
 
+def _consolidated_credit_balance_group(
+    credit_data: dict, account_balance, currency: str,
+) -> Optional[str]:
+    balance = _decimal_or_none(account_balance)
+    if balance is None:
+        return None
+
+    for line in credit_data.get("disaggregatedCreditLimits") or []:
+        if not isinstance(line, dict):
+            continue
+        if str(line.get("consolidationType") or "").upper() != "CONSOLIDADO":
+            continue
+        if str(line.get("creditLineLimitType") or "").upper() != "LIMITE_CREDITO_TOTAL":
+            continue
+        used = _decimal_or_none(line.get("usedAmount"))
+        if used is None or used != balance:
+            continue
+
+        limit = _decimal_or_none(line.get("customizedLimitAmount"))
+        if limit is None:
+            limit = _decimal_or_none(line.get("limitAmount"))
+        if limit is None:
+            continue
+        identity = {
+            "currency": currency,
+            "line_name": str(line.get("lineName") or "").upper(),
+            "limit": str(limit.normalize()),
+            "used": str(used.normalize()),
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+    return None
+
+
 def _date_or_none(value) -> Optional[date]:
     if not value:
         return None
@@ -138,6 +290,7 @@ def _build_holding_data(inv: dict) -> HoldingData:
     who care about the distinction.
     """
     current_value = _decimal_or_none(inv.get("balance")) or Decimal("0")
+    quantity = _decimal_or_none(inv.get("quantity"))
     pluggy_status = (inv.get("status") or "").upper()
     pluggy_type = (inv.get("type") or "").upper()
 
@@ -147,18 +300,28 @@ def _build_holding_data(inv: dict) -> HoldingData:
 
     metadata = {k: v for k, v in inv.items() if k not in _HOLDING_PROMOTED_KEYS}
 
+    # A fully withdrawn position reports zero (or absent) balance and
+    # quantity. When the status is TOTAL_WITHDRAWAL but the same payload
+    # still carries a nonzero balance or quantity, the status is stale or
+    # transient and the position is still open, so it must not be marked
+    # as sold (issue #819). Negative figures count as open too: hiding them
+    # would drop a real balance from the user's view.
+    position_has_value = current_value != 0 or (quantity is not None and quantity != 0)
+    is_withdrawn = pluggy_status == "TOTAL_WITHDRAWAL" and not position_has_value
+
     return HoldingData(
         external_id=str(inv["id"]),
         name=inv.get("name") or "Investment",
         currency=inv.get("currencyCode") or "BRL",
         current_value=current_value,
-        quantity=_decimal_or_none(inv.get("quantity")),
+        quantity=quantity,
         unit_price=_decimal_or_none(inv.get("value")),
         purchase_price=_decimal_or_none(inv.get("amountOriginal")),
         purchase_date=purchase_date,
         isin=inv.get("isin") or None,
         maturity_date=_date_or_none(inv.get("dueDate")),
-        is_withdrawn=pluggy_status == "TOTAL_WITHDRAWAL",
+        value_date=_date_or_none(inv.get("date")),
+        is_withdrawn=is_withdrawn,
         metadata=metadata or None,
     )
 
@@ -192,9 +355,125 @@ def _build_bill_data(raw: dict) -> Optional[BillData]:
     )
 
 
+def _reserved_balances(account: dict) -> Optional[list[ReservedBalanceData]]:
+    """Reserved/earmarked funds the account holds, or None when unreported.
+
+    Pluggy exposes Mercado Pago cofrinhos and other "saldo reservado" in
+    ``bankData.reservedBalances`` without documenting whether they are inside
+    ``balance``. They are stored and shown separately, never added to a total
+    (ADR 0022).
+
+    None means the collection is unreported or cannot be read in full, so
+    stored rows stay as they are. Only an explicitly empty collection means
+    there are no active reservations. ``availableAmounts`` carries one entry
+    per remuneration band, summed per currency; any unreadable entry or band
+    makes the entire collection unknown rather than silently dropping money.
+    """
+    bank_data = account.get("bankData")
+    if not isinstance(bank_data, dict):
+        return None
+    if bank_data.get("hasReservedBalance") is False:
+        return []
+    raw = bank_data.get("reservedBalances")
+    if not isinstance(raw, list):
+        return None
+    if not raw:
+        return []
+
+    rows: list[ReservedBalanceData] = []
+    complete = True
+    for entry in raw:
+        if not isinstance(entry, dict):
+            complete = False
+            continue
+        identification = entry.get("identification")
+        if not isinstance(identification, (str, int)) or isinstance(identification, bool):
+            complete = False
+            continue
+        external_id = str(identification).strip()
+        if not external_id:
+            complete = False
+            continue
+        raw_name = entry.get("name")
+        name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+        # One entry per remuneration band: sum them per currency. `remuneration`
+        # is display metadata and never adjusts the amount.
+        totals: dict[str, Decimal] = {}
+        bands = entry.get("availableAmounts")
+        if not isinstance(bands, list) or not bands:
+            complete = False
+            continue
+        for band in bands:
+            if not isinstance(band, dict):
+                complete = False
+                continue
+            currency = band.get("currencyCode")
+            if not isinstance(currency, str) or not currency:
+                complete = False
+                continue
+            amount = _decimal_or_none(band.get("amount"))
+            if amount is None or not amount.is_finite() or amount < 0:
+                complete = False
+                continue
+            totals[currency] = totals.get(currency, Decimal(0)) + amount
+        for currency, amount in totals.items():
+            rows.append(
+                ReservedBalanceData(
+                    external_id=external_id, name=name, currency=currency, amount=amount
+                )
+            )
+
+    if not complete or not rows:
+        logger.warning(
+            "Pluggy reported incomplete reserved balances for account %s; "
+            "keeping stored rows",
+            account.get("id"),
+        )
+        return None
+    rows.sort(key=lambda r: (r.external_id, r.currency))
+    return rows
+
+
+def _auto_invested_balance(account: dict) -> Decimal:
+    """Amount of the account balance that Pluggy has auto-invested.
+
+    Pluggy reports this in ``bankData.automaticallyInvestedBalance`` (for
+    example a checking account whose free slot is auto-applied to a CDB).
+    The same money is also listed by the provider's investments endpoint,
+    so counting it in the cash balance too would count it twice
+    (issue #843).
+    """
+    bank_data = account.get("bankData")
+    if not isinstance(bank_data, dict):
+        return Decimal(0)
+    raw = bank_data.get("automaticallyInvestedBalance")
+    if raw is None or isinstance(raw, bool):
+        return Decimal(0)
+    try:
+        value = Decimal(str(raw))
+    except InvalidOperation:
+        return Decimal(0)
+    return value if value.is_finite() and value >= 0 else Decimal(0)
+
+
+def _auto_invested_portion(account: dict) -> Decimal:
+    """Part of the reported balance that is auto-invested, clamped to [0, balance].
+
+    Pluggy's ``balance`` includes ``bankData.automaticallyInvestedBalance``.
+    The provider only reports the portion here; the sync decides whether to
+    subtract it (only when a live holding is counted for the account). A malformed
+    payload or a non-positive balance yields zero, so the cash balance can
+    never turn negative because of this field.
+    """
+    balance = Decimal(str(account.get("balance", 0)))
+    if balance <= 0:
+        return Decimal(0)
+    return min(_auto_invested_balance(account), balance)
+
+
 def _build_account_data(acc: dict, type_mapper) -> AccountData:
     """Map a Pluggy account payload to AccountData, including creditData when present."""
-    account_type = type_mapper(acc.get("type", ""))
+    account_type = type_mapper(acc.get("type", ""), acc.get("subtype"))
     credit_data = acc.get("creditData") or {}
 
     credit_limit: Optional[Decimal] = None
@@ -203,6 +482,7 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
     minimum_payment: Optional[Decimal] = None
     card_brand: Optional[str] = None
     card_level: Optional[str] = None
+    shared_balance_group: Optional[str] = None
 
     if account_type == "credit_card" and credit_data:
         raw_limit = credit_data.get("creditLimit")
@@ -215,13 +495,18 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
             minimum_payment = Decimal(str(raw_min))
         card_brand = credit_data.get("brand") or None
         card_level = credit_data.get("level") or None
+        shared_balance_group = _consolidated_credit_balance_group(
+            credit_data, acc.get("balance"), acc.get("currencyCode") or "USD"
+        )
+
+    account_currency = acc.get("currencyCode", "USD")
 
     return AccountData(
         external_id=acc["id"],
         name=acc["name"],
         type=account_type,
         balance=Decimal(str(acc.get("balance", 0))),
-        currency=acc.get("currencyCode", "USD"),
+        currency=account_currency,
         credit_limit=credit_limit,
         statement_close_day=statement_close_day,
         payment_due_day=payment_due_day,
@@ -231,6 +516,11 @@ def _build_account_data(acc: dict, type_mapper) -> AccountData:
         # Brazil has no IBAN; Pluggy's `number` is the branch/account number
         # (or the card number for credit cards), which serves the same purpose.
         masked_number=mask_last4(acc.get("number")),
+        shared_balance_group=shared_balance_group,
+        auto_invested_balance=(
+            Decimal(0) if account_type == "credit_card" else _auto_invested_portion(acc)
+        ),
+        reserved_balances=_reserved_balances(acc),
     )
 
 
@@ -245,10 +535,15 @@ class PluggyProvider(BankProvider):
 
     _api_key: Optional[str] = None
     _api_key_expires_at: float = 0
+    _credential_key: tuple[str, str] | None = None
 
     @property
     def name(self) -> str:
         return "pluggy"
+
+    @property
+    def rereads_by_date(self) -> bool:
+        return True
 
     @property
     def flow_type(self) -> str:
@@ -257,10 +552,11 @@ class PluggyProvider(BankProvider):
     async def _ensure_api_key(self) -> str:
         """Get a valid API key, refreshing if expired or about to expire (<5min remaining)."""
         now = time.time()
-        if self._api_key and (self._api_key_expires_at - now) > 300:
+        settings = self.settings
+        credential_key = (settings.pluggy_client_id, settings.pluggy_client_secret.get_secret_value())
+        if self._credential_key == credential_key and self._api_key and (self._api_key_expires_at - now) > 300:
             return self._api_key
 
-        settings = get_settings()
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.post(
                 f"{PLUGGY_API_BASE}/auth",
@@ -273,9 +569,12 @@ class PluggyProvider(BankProvider):
             data = resp.json()
 
         PluggyProvider._api_key = data["apiKey"]
+        PluggyProvider._credential_key = credential_key
         # Pluggy API keys last 2 hours
         PluggyProvider._api_key_expires_at = now + 7200
-        return PluggyProvider._api_key
+        # Another credential rotation may finish authentication before this
+        # coroutine resumes; return the token from this request's credentials.
+        return data["apiKey"]
 
     async def _headers(self) -> dict:
         api_key = await self._ensure_api_key()
@@ -343,6 +642,7 @@ class PluggyProvider(BankProvider):
         account_list = []
         for acc in raw_accounts:
             account_list.append(_build_account_data(acc, self._map_account_type))
+        await _annotate_institutions(raw_accounts, account_list)
 
         return ConnectionData(
             external_id=item_id,
@@ -387,11 +687,39 @@ class PluggyProvider(BankProvider):
         accounts = []
         for acc in data.get("results", []):
             accounts.append(_build_account_data(acc, self._map_account_type))
+        await _annotate_institutions(data.get("results", []), accounts)
         return accounts
 
     async def get_transactions(
         self, credentials: dict, account_external_id: str,
         since: Optional[date] = None, payee_source: str = "auto",
+    ) -> list[TransactionData]:
+        params: dict = {"accountId": account_external_id}
+        if since:
+            # Filter by Pluggy ingestion time, NOT transaction date.
+            # `dateFrom`/`dateTo` filter on `date` (when the txn
+            # happened), which silently drops transactions Pluggy
+            # ingests later but backdates — e.g. credit card bill
+            # payments dated to the bill close, or merchants that
+            # settle weeks late. `createdAtFrom` filters on Pluggy's
+            # row creation time, so any newly-ingested row is fetched
+            # regardless of date. v2 still supports it.
+            params["createdAtFrom"] = since.isoformat()
+        return await self._list_transactions(params, payee_source)
+
+    async def get_transactions_by_date(
+        self, credentials: dict, account_external_id: str,
+        date_from: date, payee_source: str = "auto",
+    ) -> list[TransactionData]:
+        # Rows keep their createdAt when they post, and v2 rejects updatedAtFrom,
+        # so the transaction date is the only way to find them again.
+        return await self._list_transactions(
+            {"accountId": account_external_id, "dateFrom": date_from.isoformat()},
+            payee_source,
+        )
+
+    async def _list_transactions(
+        self, base_params: dict, payee_source: str,
     ) -> list[TransactionData]:
         headers = await self._headers()
         all_transactions: list[TransactionData] = []
@@ -404,17 +732,7 @@ class PluggyProvider(BankProvider):
                 # API keys (rolled out per key). /v2/transactions pages via an
                 # opaque `after` cursor (returned in `next`) instead of
                 # page/pageSize.
-                params: dict = {"accountId": account_external_id}
-                if since:
-                    # Filter by Pluggy ingestion time, NOT transaction date.
-                    # `dateFrom`/`dateTo` filter on `date` (when the txn
-                    # happened), which silently drops transactions Pluggy
-                    # ingests later but backdates — e.g. credit card bill
-                    # payments dated to the bill close, or merchants that
-                    # settle weeks late. `createdAtFrom` filters on Pluggy's
-                    # row creation time, so any newly-ingested row is fetched
-                    # regardless of date. v2 still supports it.
-                    params["createdAtFrom"] = since.isoformat()
+                params = dict(base_params)
                 if after:
                     params["after"] = after
 
@@ -471,6 +789,24 @@ class PluggyProvider(BankProvider):
                             inst_purchase_date = date.fromisoformat(str(inst_purchase_date_raw)[:10])
                         except ValueError:
                             inst_purchase_date = None
+                    # Mercado Pago reports every installment not billed yet
+                    # with the purchase timestamp as its date, so a 10x
+                    # purchase lands whole in the month it was made. The
+                    # tell is `date` being an exact copy of `purchaseDate`,
+                    # time included: connectors that schedule installments
+                    # (Nubank) send a date of their own, even on the same
+                    # day. Such a row moves to the purchase day N-1 months
+                    # on, where Nubank puts the same installment. Posted rows
+                    # are never moved: Itaú sends billed installments with a
+                    # purchaseDate equal to their own charge date.
+                    if (
+                        status == "pending"
+                        and isinstance(inst_number, int)
+                        and inst_number > 1
+                        and inst_purchase_date is not None
+                        and txn.get("date") == inst_purchase_date_raw
+                    ):
+                        txn_date = _add_months(inst_purchase_date, inst_number - 1)
                     inst_total_amount_dec = (
                         Decimal(str(abs(inst_total_amount)))
                         if inst_total_amount is not None
@@ -482,6 +818,14 @@ class PluggyProvider(BankProvider):
                     bill_external_id_raw = cc_meta.get("billId")
                     bill_external_id = (
                         str(bill_external_id_raw) if bill_external_id_raw else None
+                    )
+                    # Only a string can be a card number; mask_last4 would
+                    # turn a stray boolean into the ending "True".
+                    raw_card_number = cc_meta.get("cardNumber")
+                    card_masked_number = (
+                        mask_last4(raw_card_number)
+                        if isinstance(raw_card_number, str)
+                        else None
                     )
 
                     all_transactions.append(
@@ -502,6 +846,7 @@ class PluggyProvider(BankProvider):
                             installment_total_amount=inst_total_amount_dec,
                             installment_purchase_date=inst_purchase_date,
                             bill_external_id=bill_external_id,
+                            card_masked_number=card_masked_number,
                         )
                     )
 
@@ -530,7 +875,7 @@ class PluggyProvider(BankProvider):
         # Pluggy manages API keys at the provider level, not per-connection
         return credentials
 
-    async def trigger_refresh(self, credentials: dict) -> RefreshOutcome:
+    async def trigger_refresh(self, credentials: dict | None) -> RefreshOutcome:
         """Trigger ``PATCH /items/{id}`` and poll the item until it leaves
         the ``UPDATING`` state.
 
@@ -759,7 +1104,12 @@ class PluggyProvider(BankProvider):
         return None
 
     @staticmethod
-    def _map_account_type(pluggy_type: str) -> str:
+    def _map_account_type(pluggy_type: str, pluggy_subtype: Optional[str] = None) -> str:
+        # Pluggy reports both checking and savings accounts as BANK, with the
+        # distinction carried in subtype (e.g. SAVINGS_ACCOUNT). Prefer the
+        # subtype so a savings account is not displayed as checking.
+        if (pluggy_subtype or "").upper() in {"SAVINGS", "SAVINGS_ACCOUNT"}:
+            return "savings"
         mapping = {
             "BANK": "checking",
             "CREDIT": "credit_card",

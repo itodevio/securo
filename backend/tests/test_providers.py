@@ -1,15 +1,18 @@
+from datetime import date
+from typing import Optional
+
 import pytest
 from unittest.mock import patch
 
 from app.providers import (
     register_provider,
     get_provider,
-    list_providers,
     all_known_providers,
     get_storage_provider,
     _PROVIDERS,
 )
 from app.providers.base import BankProvider
+from app.core.config import Settings
 
 
 class FakeProvider(BankProvider):
@@ -21,7 +24,12 @@ class FakeProvider(BankProvider):
     def flow_type(self) -> str:
         return "widget"
 
-    def get_oauth_url(self, redirect_uri: str, state: str) -> str:
+    async def get_oauth_url(
+        self,
+        redirect_uri: str,
+        state: str,
+        flow_params: Optional[dict] = None,
+    ) -> str:
         return "https://fake.example.com"
 
     async def handle_oauth_callback(self, code: str):
@@ -30,7 +38,13 @@ class FakeProvider(BankProvider):
     async def get_accounts(self, credentials: dict):
         return []
 
-    async def get_transactions(self, credentials, account_id, since, **kw):
+    async def get_transactions(
+        self,
+        credentials: dict,
+        account_external_id: str,
+        since: Optional[date] = None,
+        payee_source: str = "auto",
+    ) -> list:
         return []
 
     async def refresh_credentials(self, credentials: dict) -> dict:
@@ -56,19 +70,23 @@ def test_get_provider_unknown():
         get_provider("nonexistent_provider")
 
 
-def test_list_providers_includes_registered():
-    register_provider("fake", FakeProvider)
-    result = list_providers()
-    names = [p["name"] for p in result]
-    assert "fake" in names
-
-
 def test_all_known_providers():
     result = all_known_providers()
     assert isinstance(result, list)
     for p in result:
         assert "name" in p
         assert "configured" in p
+
+
+def test_simplefin_constructs_with_runtime_settings():
+    from app.providers.simplefin import SimpleFinProvider
+
+    settings = Settings(simplefin_enabled=True)
+    provider = get_provider("simplefin", settings=settings)
+
+    assert isinstance(provider, SimpleFinProvider)
+    assert provider.settings is settings
+    assert provider.action_required_warnings == []
 
 
 def test_get_storage_provider_local():
@@ -85,14 +103,103 @@ def test_get_storage_provider_local():
         providers_mod._storage_provider = original
 
 
+def test_get_storage_provider_s3():
+    import app.providers as providers_mod
+    from app.providers.s3_storage import S3StorageProvider
+
+    original = providers_mod._storage_provider
+    providers_mod._storage_provider = None
+    try:
+        with patch("app.core.config.get_settings") as mock_settings:
+            mock_settings.return_value.storage_provider = "s3"
+            provider = get_storage_provider()
+            assert isinstance(provider, S3StorageProvider)
+            assert provider.name == "s3"
+            assert get_storage_provider() is provider
+    finally:
+        providers_mod._storage_provider = original
+
+
+def test_local_storage_never_loads_the_s3_client():
+    """The S3 client ships in every image; with local storage it stays unloaded (ADR 0019)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "from unittest.mock import patch\n"
+        "import app.main\n"
+        "import app.providers as p\n"
+        "with patch('app.core.config.get_settings') as s:\n"
+        "    s.return_value.storage_provider = 'local'\n"
+        "    p._storage_provider = None\n"
+        "    p.get_storage_provider()\n"
+        "loaded = sorted(m for m in sys.modules if m.split('.')[0] in {'aiobotocore', 'botocore'}"
+        " or m == 'app.providers.s3_storage')\n"
+        "assert not loaded, loaded\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_get_storage_provider_unsupported():
     import app.providers as providers_mod
     original = providers_mod._storage_provider
     providers_mod._storage_provider = None
     try:
         with patch("app.core.config.get_settings") as mock_settings:
-            mock_settings.return_value.storage_provider = "s3"
-            with pytest.raises(NotImplementedError, match="s3"):
+            mock_settings.return_value.storage_provider = "unsupported"
+            with pytest.raises(NotImplementedError, match="unsupported"):
                 get_storage_provider()
     finally:
         providers_mod._storage_provider = original
+
+
+class TestOAuthRedirectDefaults:
+    """Redirect URIs fall back to FRONTEND_URL so a custom port/domain works.
+
+    Deriving here rather than in docker-compose keeps the compose files free of
+    nested `${VAR:-${OTHER:-x}}` interpolation, which podman-compose cannot
+    parse (containers/podman-compose#1064).
+    """
+
+    def _settings(self, **overrides) -> Settings:
+        return Settings(
+            frontend_url="http://localhost:3000",
+            pluggy_oauth_redirect_uri="",
+            enable_banking_oauth_redirect_uri="",
+        ).model_copy(update=overrides)
+
+    def test_default_derives_from_frontend_url(self):
+        from app.providers.base import default_oauth_redirect_uri
+
+        with patch("app.core.config.get_settings", return_value=self._settings()):
+            assert default_oauth_redirect_uri() == "http://localhost:3000/oauth/callback"
+
+    def test_default_honours_custom_port_and_domain(self):
+        from app.providers.base import default_oauth_redirect_uri
+
+        settings = self._settings(frontend_url="https://securo.example.com/")
+        with patch("app.core.config.get_settings", return_value=settings):
+            assert default_oauth_redirect_uri() == "https://securo.example.com/oauth/callback"
+
+    def test_enable_banking_uses_derived_default_when_unset(self):
+        from app.providers.enable_banking import EnableBankingProvider
+
+        settings = self._settings(frontend_url="http://localhost:3132")
+        with patch("app.core.config.get_settings", return_value=settings), \
+             patch("app.providers.enable_banking.get_settings", return_value=settings):
+            assert EnableBankingProvider().redirect_uri == "http://localhost:3132/oauth/callback"
+
+    def test_explicit_value_still_wins(self):
+        from app.providers.enable_banking import EnableBankingProvider
+
+        settings = self._settings(
+            frontend_url="http://localhost:3000",
+            enable_banking_oauth_redirect_uri="https://registered.example.com/cb",
+        )
+        with patch("app.core.config.get_settings", return_value=settings), \
+             patch("app.providers.enable_banking.get_settings", return_value=settings):
+            assert EnableBankingProvider().redirect_uri == "https://registered.example.com/cb"

@@ -22,7 +22,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Literal, Optional
+from typing import Any, AsyncIterator, Literal, Optional, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,7 +37,9 @@ from app.agents.providers.base import (
     LLMNotSupportedError,
     LLMRateLimitError,
     LLMUnavailableError,
+    Role,
     ToolCall,
+    parse_tool_arguments,
 )
 from app.agents.providers.registry import build_provider
 from app.agents.services import agent_service, context_service, conversation_service, usage_service
@@ -209,6 +211,13 @@ _RUNTIME_GUARDRAIL = (
     "`description_contains` to `aggregate` rather than listing and "
     "summing. The only acceptable place to do arithmetic yourself is a "
     "single combine step on tool outputs (e.g. `1847 * 12` = 22164).\n"
+    "\n"
+    "8. A transaction can be split across several categories: "
+    "`category_lines` is set and `category_id` is null on purpose. It is "
+    "categorized, never call it 'uncategorized'; name its parts instead. "
+    "It cannot be re-categorized as a whole (`propose_categorize` skips it); "
+    "if the user asks to, say so and suggest changing its parts in the app. "
+    "Totals by category already count each part in its own category.\n"
 )
 
 
@@ -345,6 +354,12 @@ class AgentExecutor:
         #      6. Conversation history
         #      7. The new user message (appended in step 4 below)
         history = await conversation_service.list_messages(session, conversation_id, limit=agent.max_history_messages * 2 + 2)
+        # The window can open mid-turn: a turn with parallel tool calls has an
+        # odd number of rows, so the cut can land on a tool result whose
+        # assistant call fell outside it. Providers reject an orphaned tool
+        # result, so replay from the first user message in the window.
+        while history and history[0].role != "user":
+            history.pop(0)
         messages: list[ChatMessage] = []
         # Runtime guardrail goes FIRST and applies to every conversation,
         # regardless of agent settings or per-agent system prompt. Locks
@@ -385,7 +400,10 @@ class AgentExecutor:
         for m in history:
             tcs = []
             for raw in (m.tool_calls or []):
-                tcs.append(ToolCall(id=raw.get("id"), name=raw.get("name"), arguments=raw.get("arguments") or {}))
+                tcs.append(ToolCall(
+                    id=raw.get("id"), name=raw.get("name"), arguments=raw.get("arguments") or {},
+                    thought_signature=raw.get("thought_signature"),
+                ))
             tool_call_id = (m.tool_result or {}).get("tool_call_id") if m.role == "tool" else None
             content = m.content
             if m.role == "tool":
@@ -393,7 +411,7 @@ class AgentExecutor:
                 tr = m.tool_result or {}
                 content = tr.get("text") or _safe_json(tr.get("data"))
             messages.append(ChatMessage(
-                role=m.role,  # type: ignore[arg-type]
+                role=cast(Role, m.role),
                 content=content,
                 tool_calls=tcs,
                 tool_call_id=tool_call_id,
@@ -410,8 +428,18 @@ class AgentExecutor:
         except Exception:
             logger.exception("MCP discovery failed; running without tools")
             handles = []
-        allowed = await agent_service.allowed_tool_pairs(session, agent.id)
+        discovered = self.mcp.complete_pairs(handles)
+        if discovered is not None:
+            await agent_service.initialize_tools(session, agent, discovered)
+        if agent.tools_initialized:
+            allowed = await agent_service.allowed_tool_pairs(session, agent.id)
+        else:
+            # Agent from before explicit tool lists, and a server is down:
+            # run with what was found, as before, without recording a
+            # partial list as the agent's whole list.
+            allowed = {(h.server, h.name) for h in handles}
         tool_defs = self.mcp.to_provider_tools(handles, allowed=allowed)
+        callable_names = {t.name for t in tool_defs}
 
         # Resolve provider+model once per request. Monkey-patched in tests
         # via _provider_for; production prefers _provider_and_model_for.
@@ -421,6 +449,9 @@ class AgentExecutor:
             logger.exception("provider resolution failed; falling back to legacy path")
             provider = _provider_for(agent)
             model = _model_for(agent)
+        # Some OpenAI-compatible backends route on a per-conversation
+        # session id; providers that support it read this as a header.
+        provider.session_id = str(conversation_id)
         if not model:
             yield ExecutorEvent(
                 type="error",
@@ -471,12 +502,12 @@ class AgentExecutor:
             assistant_text = "".join(text_buf)
             assembled_calls: list[ToolCall] = []
             for tc in open_calls.values():
-                import json
-                try:
-                    args = json.loads(tc["args_buf"]) if tc["args_buf"] else {}
-                except json.JSONDecodeError:
-                    args = {"_raw": tc["args_buf"]}
-                assembled_calls.append(ToolCall(id=tc["id"], name=tc["name"], arguments=args))
+                args, invalid = parse_tool_arguments(tc["args_buf"])
+                assembled_calls.append(ToolCall(
+                    id=tc["id"], name=tc["name"], arguments=args,
+                    thought_signature=tc.get("thought_signature"),
+                    invalid_arguments=invalid,
+                ))
 
             # Persist assistant turn.
             assistant_msg = await conversation_service.append_message(
@@ -484,7 +515,11 @@ class AgentExecutor:
                 conversation_id=conversation_id,
                 role="assistant",
                 content=assistant_text or None,
-                tool_calls=[{"id": c.id, "name": c.name, "arguments": c.arguments} for c in assembled_calls] or None,
+                tool_calls=[{
+                    "id": c.id, "name": c.name, "arguments": c.arguments,
+                    **({"thought_signature": c.thought_signature}
+                       if c.thought_signature is not None else {}),
+                } for c in assembled_calls] or None,
                 input_tokens=usage_input or None,
                 output_tokens=usage_output or None,
             )
@@ -535,7 +570,11 @@ class AgentExecutor:
                 yield ev
 
             results = await asyncio.gather(*[
-                _safe_call_tool(self.mcp, c, user_id=user_id, workspace_id=workspace_id, conversation_id=conversation_id, agent_id=agent.id)
+                _safe_call_tool(
+                    self.mcp, c, callable_names,
+                    user_id=user_id, workspace_id=workspace_id,
+                    conversation_id=conversation_id, agent_id=agent.id,
+                )
                 for c in assembled_calls
             ])
             for c, res in zip(assembled_calls, results):
@@ -598,11 +637,27 @@ async def _process_chunk(chunk: ChatChunk, text_buf: list[str], open_calls: dict
     elif chunk.type == "tool_call_args_delta" and chunk.tool_call_id:
         tc = open_calls.setdefault(chunk.tool_call_id, {"id": chunk.tool_call_id, "name": "", "args_buf": ""})
         tc["args_buf"] += chunk.args_delta or ""
+    elif chunk.type == "tool_call_end" and chunk.tool_call_id in open_calls:
+        open_calls[chunk.tool_call_id]["thought_signature"] = chunk.thought_signature
+
+
+def _resolve_callable(name: str, callable_names: set[str]) -> Optional[str]:
+    """Map the model's tool name to one of the tools announced this turn.
+
+    Models sometimes drop the `<server>__` prefix; a bare name resolves
+    only when exactly one announced tool has it. Anything else (a tool
+    the agent may not use, or one that was never announced) is None.
+    """
+    if name in callable_names:
+        return name
+    matches = [n for n in callable_names if n.split("__", 1)[-1] == name]
+    return matches[0] if len(matches) == 1 else None
 
 
 async def _safe_call_tool(
     mcp: MCPRegistry,
     call: ToolCall,
+    callable_names: set[str],
     *,
     user_id: uuid.UUID,
     workspace_id: Optional[uuid.UUID] = None,
@@ -610,9 +665,31 @@ async def _safe_call_tool(
     agent_id: Optional[uuid.UUID] = None,
 ) -> dict[str, Any]:
     started = time.time()
+    wire_name = _resolve_callable(call.name, callable_names)
+    if wire_name is None:
+        logger.warning("agent %s asked for tool %r, which it may not use", agent_id, call.name)
+        return {
+            "ok": False,
+            "data": None,
+            "text": f"Tool {call.name!r} is not available to this agent.",
+            "elapsed_ms": 0,
+        }
+    if call.invalid_arguments is not None:
+        # Running the tool with a guess (or the raw text under a made-up
+        # key) only fails inside the tool; tell the model what was wrong.
+        logger.warning("agent %s sent arguments for %r that are not a JSON object", agent_id, call.name)
+        return {
+            "ok": False,
+            "data": None,
+            "text": (
+                f"Tool {call.name!r} was not called: its arguments must be one JSON object, "
+                f"got {call.invalid_arguments[:200]!r}. Call it again with valid arguments."
+            ),
+            "elapsed_ms": 0,
+        }
     try:
         return await mcp.call(
-            wire_name=call.name,
+            wire_name=wire_name,
             arguments=call.arguments,
             user_id=user_id,
             workspace_id=workspace_id,

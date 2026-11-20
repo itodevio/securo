@@ -46,7 +46,7 @@ class _FakeAsyncClient:
         pass
 
     queue: list[_FakeResponse] = []
-    calls: list[tuple[str, dict, dict]] = []
+    calls: list[tuple[str, dict | None, dict | None]] = []
 
     async def __aenter__(self):
         return self
@@ -109,6 +109,30 @@ def test_parse_servers_handles_extra_with_and_without_alias(monkeypatch):
     assert urls["gamma"] == "http://c:9002/mcp"
 
 
+@pytest.mark.parametrize("name", ["rep__orts", "reports_", "a__b__c", "x_"])
+def test_parse_servers_skips_names_that_break_the_wire_name(monkeypatch, name):
+    """Calls go out as `<server>__<tool>` and are split at the first "__".
+    With servers `reports` and `reports_`, `reports___x` would reach
+    `reports` asking for `_x`."""
+    from app.agents.config import get_agent_settings
+
+    s = get_agent_settings()
+    monkeypatch.setattr(s, "extra_mcp_servers", f"http://a:9000/mcp|{name}, http://b:9001/mcp|reports")
+    assert [sp.name for sp in _parse_servers()] == ["securo", "reports"]
+
+
+def test_parse_servers_keeps_a_long_url_name_and_skips_one_too_long(monkeypatch):
+    """An aliasless server is named by its URL; a long one must still fit
+    agent_tools.server, and one past the column is refused, not truncated."""
+    from app.agents.config import get_agent_settings
+
+    long_url = "https://mcp.example.com/" + "a" * 100 + "/mcp"
+    too_long = "https://mcp.example.com/" + "b" * 600
+    s = get_agent_settings()
+    monkeypatch.setattr(s, "extra_mcp_servers", f"{long_url}, {too_long}")
+    assert [sp.name for sp in _parse_servers()] == ["securo", long_url]
+
+
 # --------------------------------------------------------------------- MCPClient.list_tools
 
 @pytest.mark.asyncio
@@ -143,6 +167,8 @@ async def test_list_tools_parses_securo_extras_and_defaults_schema():
     assert by_name["create_payee"].parameters == {"type": "object", "properties": {}}
     # Bearer header is propagated.
     _, _, headers = _FakeAsyncClient.calls[0]
+
+    assert headers is not None
     assert headers["Authorization"] == "Bearer fake"
 
 
@@ -237,7 +263,7 @@ def test_to_provider_tools_namespaces_and_filters():
     filtered = MCPRegistry.to_provider_tools(handles, allowed={("securo", "list_accounts")})
     assert [t.name for t in filtered] == ["securo__list_accounts"]
     # Defaults a missing parameters schema to an empty object schema.
-    handle_no_schema = ToolHandle(server="x", name="y", description="d", parameters=None)  # type: ignore[arg-type]
+    handle_no_schema = ToolHandle(server="x", name="y", description="d", parameters={})
     out = MCPRegistry.to_provider_tools([handle_no_schema], allowed=None)
     assert out[0].parameters == {"type": "object", "properties": {}}
 
@@ -280,6 +306,26 @@ async def test_registry_discover_swallows_per_server_errors(monkeypatch):
     reg = MCPRegistry()
     handles = await reg.discover(user_id=uuid.uuid4())
     assert {h.name for h in handles} == {"a"}
+
+
+@pytest.mark.asyncio
+async def test_registry_discover_warns_when_a_server_is_unreachable(monkeypatch, caplog):
+    """An unreachable server leaves the agent with no tools while the chat
+    still answers, so the log has to name the server and its URL. Otherwise
+    the only symptom is an assistant saying it can't see any data."""
+    from app.agents.config import get_agent_settings
+
+    monkeypatch.setattr(get_agent_settings(), "extra_mcp_servers", "")
+    monkeypatch.setattr(get_agent_settings(), "builtin_mcp_url", "http://mcp-server:8765/mcp")
+    _FakeAsyncClient.queue.append(_FakeResponse(status_code=500, json_body={}))
+
+    reg = MCPRegistry()
+    with caplog.at_level("WARNING", logger="app.agents.mcp.client"):
+        handles = await reg.discover(user_id=uuid.uuid4())
+
+    assert handles == []
+    assert "http://mcp-server:8765/mcp" in caplog.text
+    assert "securo" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -326,3 +372,18 @@ def test_registry_exposes_server_names(monkeypatch):
     monkeypatch.setattr(get_agent_settings(), "extra_mcp_servers", "http://b:9001/mcp|beta")
     reg = MCPRegistry()
     assert set(reg.server_names()) == {"securo", "beta"}
+
+
+@pytest.mark.asyncio
+async def test_list_tools_keeps_a_long_tool_name_and_skips_one_too_long():
+    """MCP allows names up to 128 characters; one past agent_tools.tool_name
+    can't be recorded and is left out rather than truncated."""
+    _FakeAsyncClient.queue.append(_FakeResponse(json_body={
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"tools": [{"name": "a" * 128}, {"name": "b" * 256}]},
+    }))
+
+    handles = await MCPClient(name="ext", url="http://mcp.test/mcp").list_tools(token="fake")
+
+    assert [h.name for h in handles] == ["a" * 128]

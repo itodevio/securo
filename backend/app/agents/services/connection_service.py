@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import uuid
+from ipaddress import ip_address
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse, urlsplit
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,6 +16,29 @@ from app.agents.services.crypto import decrypt, encrypt
 
 
 VALID_KINDS = set(list_providers())  # ollama, openai, anthropic, openai_compatible
+
+INVALID_BASE_URL = "Enter a valid http or https endpoint URL"
+
+
+def _clean_base_url(base_url: Optional[str]) -> Optional[str]:
+    """Strip a base URL and reject one the providers could never call."""
+    if base_url is None:
+        return None
+    base_url = base_url.strip()
+    if not base_url:
+        return ""  # on update, an empty string clears the field
+    try:
+        parts = urlsplit(base_url)
+        _ = parts.port  # raises ValueError on a port that is not a number in range
+    except ValueError as exc:
+        raise ValueError(INVALID_BASE_URL) from exc
+    if (
+        parts.scheme not in ("http", "https")
+        or not parts.hostname
+        or any(c.isspace() for c in base_url)
+    ):
+        raise ValueError(INVALID_BASE_URL)
+    return base_url
 
 
 async def list_connections(session: AsyncSession, user_id: uuid.UUID) -> list[LlmConnection]:
@@ -49,6 +75,7 @@ async def create_connection(
 ) -> LlmConnection:
     if kind not in VALID_KINDS:
         raise ValueError(f"unknown kind '{kind}', expected one of {sorted(VALID_KINDS)}")
+    base_url = _clean_base_url(base_url)
     if kind == "openai_compatible" and not base_url:
         raise ValueError("openai_compatible requires base_url")
 
@@ -86,6 +113,7 @@ async def update_connection(
     conn = await get_connection(session, conn_id, user_id)
     if conn is None:
         return None
+    base_url = _clean_base_url(base_url)
     if name is not None:
         conn.name = name.strip()
     if base_url is not None:
@@ -132,6 +160,54 @@ def build_provider_for_connection(conn: LlmConnection):
     )
 
 
+def _in_container() -> bool:
+    """Whether this process runs inside a container. Only used to decide
+    whether a routing hint would help; never to change behaviour."""
+    return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+
+
+def _routing_hint(url: str) -> str:
+    """Point at the usual cause when a container can't reach a model server
+    the user can reach from their browser: the address is theirs, not the
+    container's."""
+    if not url or not _in_container():
+        return ""
+    host = (urlparse(url).hostname or "").strip("[]").lower()
+    if not host:
+        return ""
+    port = urlparse(url).port
+    suggestion = f"http://host.docker.internal:{port}" if port else "http://host.docker.internal"
+
+    if host == "localhost":
+        loopback, private = True, False
+    else:
+        try:
+            ip = ip_address(host)
+        except ValueError:
+            return ""
+        loopback, private = ip.is_loopback, ip.is_private
+
+    if loopback:
+        return (
+            f". Securo runs in a container, where localhost is the container itself. "
+            f"Use {suggestion} when the model server runs on the host machine."
+        )
+    if private:
+        return (
+            f". Securo runs in a container, which often can't reach the host's LAN address. "
+            f"Use {suggestion} when the model server runs on the host machine."
+        )
+    return ""
+
+
+def _unreachable(url: str, exc: Exception) -> dict[str, Any]:
+    """Never return a bare 'unreachable:'. Connect timeouts stringify to an
+    empty message, which left the UI showing no reason at all."""
+    reason = str(exc).strip() or type(exc).__name__
+    where = f" at {url}" if url else ""
+    return {"ok": False, "detail": f"unreachable{where}: {reason}{_routing_hint(url)}"}
+
+
 async def test_connection(conn: LlmConnection) -> dict[str, Any]:
     """Live probe. For Ollama we list models; for OpenAI/Anthropic we do
     a tiny embedding or a 1-token chat. Returns {ok, detail, models?}."""
@@ -139,10 +215,13 @@ async def test_connection(conn: LlmConnection) -> dict[str, Any]:
 
     api_key = decrypt(conn.api_key_encrypted) or ""
     timeout = httpx.Timeout(10.0, connect=5.0)
+    # Tracked so the failure path can name the address that was tried.
+    attempted = conn.base_url or ""
 
     try:
         if conn.kind == "ollama":
             url = (conn.base_url or "http://ollama:11434").rstrip("/") + "/api/tags"
+            attempted = url
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.get(url)
                 r.raise_for_status()
@@ -156,6 +235,7 @@ async def test_connection(conn: LlmConnection) -> dict[str, Any]:
             from app.agents.providers.openai import normalize_openai_base_url
 
             base = normalize_openai_base_url(conn.base_url or "https://api.openai.com/v1")
+            attempted = base
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.get(f"{base}/models", headers=headers)
@@ -180,6 +260,7 @@ async def test_connection(conn: LlmConnection) -> dict[str, Any]:
 
         if conn.kind == "anthropic":
             base = (conn.base_url or "https://api.anthropic.com/v1").rstrip("/")
+            attempted = base
             headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.get(f"{base}/models", headers=headers)
@@ -193,6 +274,6 @@ async def test_connection(conn: LlmConnection) -> dict[str, Any]:
         return {"ok": False, "detail": f"unknown kind: {conn.kind}"}
 
     except httpx.HTTPError as exc:
-        return {"ok": False, "detail": f"unreachable: {exc}"}
+        return _unreachable(attempted, exc)
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "detail": str(exc)}
+        return {"ok": False, "detail": str(exc).strip() or type(exc).__name__}

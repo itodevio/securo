@@ -1,14 +1,18 @@
 import { useMemo, useRef, useState } from 'react'
-import { getAccountName } from '@/lib/account-utils'
+import { getAccountName, sortAccountsByDisplayName } from '@/lib/account-utils'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
-import { format, startOfMonth, startOfYear, subDays } from 'date-fns'
+import { startOfMonth, startOfYear, subDays } from 'date-fns'
 import {
   ArrowUpDown,
   Calendar as CalendarIcon,
   Check,
   ChevronRight,
   Coins,
+  CreditCard,
+  EyeClosed,
+  Flag,
+  ListChecks,
   ListFilter,
   Search,
   Store,
@@ -39,9 +43,16 @@ import {
 import { Calendar } from '@/components/ui/calendar'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
+import type { FlagFilter } from '@/lib/transaction-flag'
+import { localDateString } from '@/lib/date-utils'
+import { formatDateRange } from '@/lib/date-range-format'
 import { resolveDateFnsLocale } from '@/lib/date-fns-locale'
 import { CategoryFilterContent } from '@/components/category-filter-content'
-import type { Account, Category, CategoryGroup, Group, Payee } from '@/types'
+import {
+  MobileTransactionsFilterMenu,
+  type MobileFilterView,
+} from '@/components/mobile-transactions-filter-menu'
+import type { Account, AccountCard, Category, CategoryGroup, Group, Payee } from '@/types'
 
 interface TransactionsFilterBarProps {
   searchInput: string
@@ -49,6 +60,10 @@ interface TransactionsFilterBarProps {
   onSearchSubmit?: (value: string) => void
   filterAccountIds: string[]
   onAccountIdsChange: (value: string[]) => void
+  accountSelectionMode?: 'multiple' | 'single'
+  linkedCards: AccountCard[]
+  filterLinkedCardIds: string[]
+  onLinkedCardIdsChange: (value: string[]) => void
   filterCategoryIds: string[]
   onCategoryIdsChange: (value: string[]) => void
   filterUncategorized: boolean
@@ -59,6 +74,12 @@ interface TransactionsFilterBarProps {
   onGroupIdChange: (value: string) => void
   filterType: string
   onTypeChange: (value: string) => void
+  filterStatus: string
+  onStatusChange: (value: string) => void
+  hideIgnored: boolean
+  onHideIgnoredChange: (value: boolean) => void
+  filterFlag: FlagFilter
+  onFlagFilterChange: (value: FlagFilter) => void
   filterFrom: string
   filterTo: string
   onDateRangeChange: (from: string, to: string) => void
@@ -68,13 +89,13 @@ interface TransactionsFilterBarProps {
   onClearAll: () => void
   accounts: Account[]
   categories: Category[]
+  /** Catalog used only to label active filters, so a filter kept in the URL
+   * still names its category after that category is hidden. Selectable
+   * options always come from `categories`. */
+  referenceCategories?: Category[]
   categoryGroups: CategoryGroup[]
   payees: Payee[]
   groups: Group[]
-}
-
-function toISODate(d: Date): string {
-  return format(d, 'yyyy-MM-dd')
 }
 
 function toggleInArray(arr: string[], id: string): string[] {
@@ -87,6 +108,10 @@ export function TransactionsFilterBar({
   onSearchSubmit,
   filterAccountIds,
   onAccountIdsChange,
+  accountSelectionMode = 'multiple',
+  linkedCards,
+  filterLinkedCardIds,
+  onLinkedCardIdsChange,
   filterCategoryIds,
   onCategoryIdsChange,
   filterUncategorized,
@@ -97,6 +122,12 @@ export function TransactionsFilterBar({
   onGroupIdChange,
   filterType,
   onTypeChange,
+  filterStatus,
+  onStatusChange,
+  hideIgnored,
+  onHideIgnoredChange,
+  filterFlag,
+  onFlagFilterChange,
   filterFrom,
   filterTo,
   onDateRangeChange,
@@ -106,6 +137,7 @@ export function TransactionsFilterBar({
   onClearAll,
   accounts,
   categories,
+  referenceCategories,
   categoryGroups,
   payees,
   groups,
@@ -116,8 +148,10 @@ export function TransactionsFilterBar({
   const dateFnsLocale = resolveDateFnsLocale(i18n.resolvedLanguage ?? i18n.language)
   const [menuOpen, setMenuOpen] = useState(false)
   const [accountSubOpen, setAccountSubOpen] = useState(false)
+  const [linkedCardSubOpen, setLinkedCardSubOpen] = useState(false)
   const [categorySubOpen, setCategorySubOpen] = useState(false)
   const keepAccountSubOpenRef = useRef(false)
+  const keepLinkedCardSubOpenRef = useRef(false)
   const keepCategorySubOpenRef = useRef(false)
   const [dateCustomOpen, setDateCustomOpen] = useState(false)
   const [draftFrom, setDraftFrom] = useState<string>(filterFrom)
@@ -125,7 +159,9 @@ export function TransactionsFilterBar({
   const [amountSubOpen, setAmountSubOpen] = useState(false)
   const [draftMinAmount, setDraftMinAmount] = useState<string>(filterMinAmount)
   const [draftMaxAmount, setDraftMaxAmount] = useState<string>(filterMaxAmount)
+  const [mobileFilterView, setMobileFilterView] = useState<MobileFilterView>('root')
   const searchRef = useRef<HTMLInputElement>(null)
+  const sortedAccounts = useMemo(() => sortAccountsByDisplayName(accounts), [accounts])
 
   // When a CheckRow is clicked inside a submenu, Radix tries to close the submenu
   // even if we preventDefault in onSelect. We intercept the close request so the
@@ -144,14 +180,24 @@ export function TransactionsFilterBar({
     }
     setCategorySubOpen(open)
   }
+  const handleLinkedCardSubOpenChange = (open: boolean) => {
+    if (!open && keepLinkedCardSubOpenRef.current) {
+      keepLinkedCardSubOpenRef.current = false
+      return
+    }
+    setLinkedCardSubOpen(open)
+  }
   // When the root menu closes, make sure submenus close too so a fresh open starts clean.
   const handleMenuOpenChange = (open: boolean) => {
     setMenuOpen(open)
     if (!open) {
       setAccountSubOpen(false)
+      setLinkedCardSubOpen(false)
       setCategorySubOpen(false)
       setAmountSubOpen(false)
+      setMobileFilterView('root')
       keepAccountSubOpenRef.current = false
+      keepLinkedCardSubOpenRef.current = false
       keepCategorySubOpenRef.current = false
     }
   }
@@ -165,8 +211,9 @@ export function TransactionsFilterBar({
   const categoryById = useMemo(() => {
     const map = new Map<string, Category>()
     categories.forEach((c) => map.set(c.id, c))
+    referenceCategories?.forEach((c) => map.set(c.id, c))
     return map
-  }, [categories])
+  }, [categories, referenceCategories])
 
   const selectedPayee = useMemo(
     () => payees.find((p) => p.id === filterPayee),
@@ -178,13 +225,34 @@ export function TransactionsFilterBar({
     [groups, filterGroupId],
   )
 
+  const linkedCardById = useMemo(
+    () => new Map(linkedCards.map((card) => [card.id, card])),
+    [linkedCards],
+  )
+  const linkedCardsByAccount = useMemo(() => {
+    const grouped = new Map<string, AccountCard[]>()
+    for (const card of linkedCards) {
+      grouped.set(card.account_id, [...(grouped.get(card.account_id) ?? []), card])
+    }
+    return grouped
+  }, [linkedCards])
+
+  const linkedCardLabel = (card: AccountCard) => {
+    const ending = t('accounts.cardEnding', { number: card.masked_number })
+    return card.label ? `${card.label} · ${ending}` : ending
+  }
+
   const hasAnyFilter =
     filterAccountIds.length > 0 ||
+    filterLinkedCardIds.length > 0 ||
     filterCategoryIds.length > 0 ||
     filterUncategorized ||
     !!filterPayee ||
     !!filterGroupId ||
     !!filterType ||
+    !!filterStatus ||
+    hideIgnored ||
+    !!filterFlag ||
     !!filterFrom ||
     !!filterTo ||
     !!filterMinAmount ||
@@ -196,18 +264,30 @@ export function TransactionsFilterBar({
       ? t('transactions.income')
       : filterType === 'debit'
         ? t('transactions.expense')
+        : filterType === 'transfer'
+          ? t('transactions.transfer')
+          : ''
+
+  const flagOptions: { value: FlagFilter; label: string }[] = [
+    { value: '', label: t('transactions.all') },
+    { value: 'all', label: t('transactions.flagFilterAll') },
+    { value: 'overdue', label: t('transactions.flagFilterOverdue') },
+    { value: 'soon', label: t('transactions.flagFilterSoon') },
+  ]
+  const flagLabel = filterFlag
+    ? flagOptions.find((opt) => opt.value === filterFlag)?.label ?? ''
+    : ''
+
+  const statusLabel =
+    filterStatus === 'pending'
+      ? t('transactions.statusPending')
+      : filterStatus === 'posted'
+        ? t('transactions.statusPosted')
         : ''
 
   const dateLabel = useMemo(() => {
     if (!filterFrom && !filterTo) return null
-    const fmt = (iso: string) =>
-      new Date(iso + 'T00:00:00').toLocaleDateString(dateLocale, {
-        day: '2-digit',
-        month: 'short',
-      })
-    if (filterFrom && filterTo) return `${fmt(filterFrom)} — ${fmt(filterTo)}`
-    if (filterFrom) return `≥ ${fmt(filterFrom)}`
-    return `≤ ${fmt(filterTo)}`
+    return formatDateRange(filterFrom, filterTo, dateLocale, { compact: true })
   }, [filterFrom, filterTo, dateLocale])
 
   const amountLabel = useMemo(() => {
@@ -259,38 +339,38 @@ export function TransactionsFilterBar({
       {
         key: 'today',
         label: t('transactions.filtersBar.datePresets.today'),
-        from: toISODate(today),
-        to: toISODate(today),
+        from: localDateString(today),
+        to: localDateString(today),
       },
       {
         key: 'last7',
         label: t('transactions.filtersBar.datePresets.last7'),
-        from: toISODate(subDays(today, 6)),
-        to: toISODate(today),
+        from: localDateString(subDays(today, 6)),
+        to: localDateString(today),
       },
       {
         key: 'last30',
         label: t('transactions.filtersBar.datePresets.last30'),
-        from: toISODate(subDays(today, 29)),
-        to: toISODate(today),
+        from: localDateString(subDays(today, 29)),
+        to: localDateString(today),
       },
       {
         key: 'thisMonth',
         label: t('transactions.filtersBar.datePresets.thisMonth'),
-        from: toISODate(startOfMonth(today)),
-        to: toISODate(today),
+        from: localDateString(startOfMonth(today)),
+        to: localDateString(today),
       },
       {
         key: 'last90',
         label: t('transactions.filtersBar.datePresets.last90'),
-        from: toISODate(subDays(today, 89)),
-        to: toISODate(today),
+        from: localDateString(subDays(today, 89)),
+        to: localDateString(today),
       },
       {
         key: 'thisYear',
         label: t('transactions.filtersBar.datePresets.thisYear'),
-        from: toISODate(startOfYear(today)),
-        to: toISODate(today),
+        from: localDateString(startOfYear(today)),
+        to: localDateString(today),
       },
     ]
   }, [t])
@@ -311,6 +391,16 @@ export function TransactionsFilterBar({
         ? (getAccountName(accountById.get(filterAccountIds[0]) ?? { name: '', display_name: null }))
         : ''
 
+  const linkedCardSummary =
+    filterLinkedCardIds.length > 1
+      ? t('transactions.filtersBar.nSelected', { count: filterLinkedCardIds.length })
+      : filterLinkedCardIds.length === 1
+        ? (() => {
+            const card = linkedCardById.get(filterLinkedCardIds[0])
+            return card ? linkedCardLabel(card) : ''
+          })()
+        : ''
+
   const categorySummary = (() => {
     const total = filterCategoryIds.length + (filterUncategorized ? 1 : 0)
     if (total > 1)
@@ -320,7 +410,6 @@ export function TransactionsFilterBar({
       return categoryById.get(filterCategoryIds[0])?.name ?? ''
     return ''
   })()
-
   return (
     <div className="mb-4">
       <Popover open={dateCustomOpen} onOpenChange={setDateCustomOpen} modal={true}>
@@ -344,7 +433,7 @@ export function TransactionsFilterBar({
         />
 
         {/* Right-side controls */}
-        <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
+        <div className="ms-auto flex shrink-0 items-center gap-1 ps-1">
           {hasAnyFilter && (
             <button
               type="button"
@@ -361,7 +450,7 @@ export function TransactionsFilterBar({
                 type="button"
                 aria-label={t('transactions.filtersBar.filters')}
                 className={cn(
-                  'inline-flex h-8 items-center gap-1.5 rounded-md border border-border/80 bg-background px-2.5 text-[12px] font-medium text-muted-foreground transition-colors',
+                  'inline-flex h-8 items-center gap-1.5 rounded-md border border-border/80 bg-card px-2.5 text-[12px] font-medium text-muted-foreground transition-colors',
                   'hover:bg-muted hover:text-foreground',
                   menuOpen && 'bg-muted text-foreground',
                   hasAnyFilter && 'border-primary/30 text-primary hover:text-primary',
@@ -376,13 +465,75 @@ export function TransactionsFilterBar({
             <DropdownMenuContent
               align="end"
               sideOffset={6}
-              className="w-[240px] p-1"
+              className="w-[min(18rem,calc(100vw-2rem))] p-1 sm:w-[240px]"
             >
+              <MobileTransactionsFilterMenu
+                view={mobileFilterView}
+                setView={setMobileFilterView}
+                setMenuOpen={setMenuOpen}
+                accounts={sortedAccounts}
+                categories={categories}
+                categoryGroups={categoryGroups}
+                payees={payees}
+                groups={groups}
+                accountIds={filterAccountIds}
+                linkedCards={linkedCards}
+                linkedCardIds={filterLinkedCardIds}
+                categoryIds={filterCategoryIds}
+                uncategorized={filterUncategorized}
+                payeeId={filterPayee}
+                groupId={filterGroupId}
+                type={filterType}
+                from={filterFrom}
+                to={filterTo}
+                minAmount={draftMinAmount}
+                maxAmount={draftMaxAmount}
+                appliedMinAmount={filterMinAmount}
+                appliedMaxAmount={filterMaxAmount}
+                setMinAmount={setDraftMinAmount}
+                setMaxAmount={setDraftMaxAmount}
+                summaries={{
+                  account: accountSummary,
+                  card: linkedCardSummary,
+                  category: categorySummary,
+                  payee: selectedPayee?.name,
+                  group: selectedGroup?.name,
+                  type: typeLabel,
+                  status: statusLabel,
+                  ignored: hideIgnored ? t('transactions.ignoredHide') : undefined,
+                  flagged: flagLabel || undefined,
+                  date: dateLabel,
+                  amount: amountLabel,
+                }}
+                datePresets={datePresets}
+                hasAnyFilter={hasAnyFilter}
+                onAccountIdsChange={onAccountIdsChange}
+                onLinkedCardIdsChange={onLinkedCardIdsChange}
+                onCategoryIdsChange={onCategoryIdsChange}
+                onUncategorizedChange={onUncategorizedChange}
+                onPayeeChange={onPayeeChange}
+                onGroupIdChange={onGroupIdChange}
+                onTypeChange={onTypeChange}
+                status={filterStatus}
+                onStatusChange={onStatusChange}
+                hideIgnored={hideIgnored}
+                onHideIgnoredChange={onHideIgnoredChange}
+                flagFilter={filterFlag}
+                flagOptions={flagOptions}
+                onFlagFilterChange={onFlagFilterChange}
+                onDateRangeChange={onDateRangeChange}
+                onAmountRangeChange={onAmountRangeChange}
+                onApplyAmountRange={applyAmountRange}
+                onOpenCustomRange={openCustomRange}
+                onClearAll={onClearAll}
+              />
+
+              <div className="hidden sm:block">
               <DropdownMenuLabel className="px-2 py-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
                 {t('transactions.filtersBar.filterBy')}
               </DropdownMenuLabel>
               <DropdownMenuGroup>
-                {/* Account submenu (multi) */}
+                {/* Account submenu: calendar mode is all-or-one; list mode stays multi-select. */}
                 <DropdownMenuSub
                   open={accountSubOpen}
                   onOpenChange={handleAccountSubOpenChange}
@@ -401,12 +552,57 @@ export function TransactionsFilterBar({
                       sideOffset={8}
                       className="max-h-[320px] w-[240px] overflow-y-auto p-1"
                     >
-                      {accounts.length === 0 ? (
+                      {accountSelectionMode === 'single' && (
+                        <>
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              onAccountIdsChange([])
+                            }}
+                            className={cn(
+                              'gap-2 rounded-sm px-2 py-1.5 text-[13px]',
+                              filterAccountIds.length === 0 && 'bg-primary/5',
+                            )}
+                          >
+                            <span className="min-w-0 flex-1 truncate text-start">
+                              {t('transactions.all')}
+                            </span>
+                            {filterAccountIds.length === 0 && <Check size={13} className="text-primary" />}
+                          </DropdownMenuItem>
+                          <div className="my-1 h-px bg-border/60" />
+                        </>
+                      )}
+                      {sortedAccounts.length === 0 ? (
                         <div className="px-2 py-3 text-center text-[12px] text-muted-foreground">
                           {t('transactions.filtersBar.noOptions')}
                         </div>
+                      ) : accountSelectionMode === 'single' ? (
+                        sortedAccounts.map((a) => {
+                          const checked = filterAccountIds[0] === a.id
+                          return (
+                            <DropdownMenuItem
+                              key={a.id}
+                              onSelect={() => {
+                                onAccountIdsChange(checked ? [] : [a.id])
+                              }}
+                              className={cn(
+                                'gap-2 rounded-sm px-2 py-1.5 text-[13px]',
+                                checked && 'bg-primary/5',
+                              )}
+                            >
+                              <span className="min-w-0 flex-1 truncate text-start">
+                                {getAccountName(a)}
+                              </span>
+                              {a.currency && (
+                                <span className="text-[10.5px] uppercase tracking-wide text-muted-foreground/70">
+                                  {a.currency}
+                                </span>
+                              )}
+                              {checked && <Check size={13} className="text-primary" />}
+                            </DropdownMenuItem>
+                          )
+                        })
                       ) : (
-                        accounts.map((a) => (
+                        sortedAccounts.map((a) => (
                           <DropdownMenuCheckboxItem
                             key={a.id}
                             checked={filterAccountIds.includes(a.id)}
@@ -419,7 +615,7 @@ export function TransactionsFilterBar({
                             }}
                             className="gap-2 rounded-sm py-1.5 text-[13px]"
                           >
-                            <span className="min-w-0 flex-1 truncate text-left">
+                            <span className="min-w-0 flex-1 truncate text-start">
                               {getAccountName(a)}
                             </span>
                             {a.currency && (
@@ -430,7 +626,7 @@ export function TransactionsFilterBar({
                           </DropdownMenuCheckboxItem>
                         ))
                       )}
-                      {filterAccountIds.length > 0 && (
+                      {accountSelectionMode === 'multiple' && filterAccountIds.length > 0 && (
                         <>
                           <div className="my-1 h-px bg-border/60" />
                           <DropdownMenuItem
@@ -449,6 +645,72 @@ export function TransactionsFilterBar({
                     </DropdownMenuSubContent>
                   </DropdownMenuPortal>
                 </DropdownMenuSub>
+
+                {linkedCards.length > 0 && (
+                  <DropdownMenuSub
+                    open={linkedCardSubOpen}
+                    onOpenChange={handleLinkedCardSubOpenChange}
+                  >
+                    <DropdownMenuSubTrigger className="gap-2 text-[13px]">
+                      <CreditCard size={14} className="text-muted-foreground" />
+                      <span className="flex-1">{t('transactions.card')}</span>
+                      {linkedCardSummary && (
+                        <span className="max-w-[90px] truncate text-[11px] text-muted-foreground">
+                          {linkedCardSummary}
+                        </span>
+                      )}
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuPortal>
+                      <DropdownMenuSubContent
+                        sideOffset={8}
+                        className="max-h-[320px] w-[260px] overflow-y-auto p-1"
+                      >
+                        {[...linkedCardsByAccount].map(([accountId, cards]) => (
+                          <div key={accountId}>
+                            <DropdownMenuLabel className="px-2 pb-1 pt-2 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
+                              {getAccountName(accountById.get(accountId) ?? { name: '', display_name: null })}
+                            </DropdownMenuLabel>
+                            {cards.map((card) => (
+                              <DropdownMenuCheckboxItem
+                                key={card.id}
+                                checked={filterLinkedCardIds.includes(card.id)}
+                                onSelect={(event) => {
+                                  event.preventDefault()
+                                  keepLinkedCardSubOpenRef.current = true
+                                  onLinkedCardIdsChange(
+                                    toggleInArray(filterLinkedCardIds, card.id),
+                                  )
+                                }}
+                                className="gap-2 rounded-sm py-1.5 text-[13px]"
+                              >
+                                <CreditCard size={14} className="text-muted-foreground" />
+                                <span className="min-w-0 flex-1 truncate text-left">
+                                  {linkedCardLabel(card)}
+                                </span>
+                              </DropdownMenuCheckboxItem>
+                            ))}
+                          </div>
+                        ))}
+                        {filterLinkedCardIds.length > 0 && (
+                          <>
+                            <div className="my-1 h-px bg-border/60" />
+                            <DropdownMenuItem
+                              onSelect={(event) => {
+                                event.preventDefault()
+                                keepLinkedCardSubOpenRef.current = true
+                                onLinkedCardIdsChange([])
+                              }}
+                              className="gap-2 rounded-sm px-2 py-1.5 text-[12px] text-muted-foreground"
+                            >
+                              <X size={12} />
+                              {t('transactions.filtersBar.clearSelection')}
+                            </DropdownMenuItem>
+                          </>
+                        )}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuPortal>
+                  </DropdownMenuSub>
+                )}
 
                 {/* Category submenu (multi) */}
                 <DropdownMenuSub
@@ -506,7 +768,7 @@ export function TransactionsFilterBar({
                         )}
                       >
                         <span className="size-2.5 shrink-0" />
-                        <span className="min-w-0 flex-1 truncate text-left">
+                        <span className="min-w-0 flex-1 truncate text-start">
                           {t('transactions.all')}
                         </span>
                         {!filterPayee && <Check size={13} className="text-primary" />}
@@ -527,7 +789,7 @@ export function TransactionsFilterBar({
                             )}
                           >
                             <span className="size-2.5 shrink-0" />
-                            <span className="min-w-0 flex-1 truncate text-left">
+                            <span className="min-w-0 flex-1 truncate text-start">
                               {p.name}
                             </span>
                             {filterPayee === p.id && (
@@ -564,7 +826,7 @@ export function TransactionsFilterBar({
                         )}
                       >
                         <span className="size-2.5 shrink-0" />
-                        <span className="min-w-0 flex-1 truncate text-left">
+                        <span className="min-w-0 flex-1 truncate text-start">
                           {t('transactions.all')}
                         </span>
                         {!filterGroupId && <Check size={13} className="text-primary" />}
@@ -585,7 +847,7 @@ export function TransactionsFilterBar({
                             )}
                           >
                             <span className="size-2.5 shrink-0" />
-                            <span className="min-w-0 flex-1 truncate text-left">
+                            <span className="min-w-0 flex-1 truncate text-start">
                               {g.name}
                             </span>
                             {filterGroupId === g.id && (
@@ -598,7 +860,7 @@ export function TransactionsFilterBar({
                   </DropdownMenuPortal>
                 </DropdownMenuSub>
 
-                {/* Type submenu (single — income vs expense) */}
+                {/* Type submenu (single: income, expense or transfer) */}
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger className="gap-2 text-[13px]">
                     <ArrowUpDown size={14} className="text-muted-foreground" />
@@ -618,6 +880,7 @@ export function TransactionsFilterBar({
                         { value: '', label: t('transactions.all') },
                         { value: 'credit', label: t('transactions.income') },
                         { value: 'debit', label: t('transactions.expense') },
+                        { value: 'transfer', label: t('transactions.transfer') },
                       ].map((opt) => (
                         <DropdownMenuItem
                           key={opt.value || 'all'}
@@ -628,10 +891,104 @@ export function TransactionsFilterBar({
                           )}
                         >
                           <span className="size-2.5 shrink-0" />
-                          <span className="min-w-0 flex-1 truncate text-left">
+                          <span className="min-w-0 flex-1 truncate text-start">
                             {opt.label}
                           </span>
                           {filterType === opt.value && (
+                            <Check size={13} className="text-primary" />
+                          )}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuPortal>
+                </DropdownMenuSub>
+
+                {/* Status submenu (single — posted vs pending) */}
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger className="gap-2 text-[13px]">
+                    <ListChecks size={14} className="text-muted-foreground" />
+                    <span className="flex-1">{t('transactions.status')}</span>
+                    {statusLabel && (
+                      <span className="max-w-[90px] truncate text-[11px] text-muted-foreground">
+                        {statusLabel}
+                      </span>
+                    )}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuPortal>
+                    <DropdownMenuSubContent
+                      sideOffset={8}
+                      className="w-[200px] p-1"
+                    >
+                      {[
+                        { value: '', label: t('transactions.all') },
+                        { value: 'pending', label: t('transactions.statusPending') },
+                        { value: 'posted', label: t('transactions.statusPosted') },
+                      ].map((opt) => (
+                        <DropdownMenuItem
+                          key={opt.value || 'all'}
+                          onSelect={() => onStatusChange(opt.value)}
+                          className={cn(
+                            'gap-2 rounded-sm px-2 py-1.5 text-[13px]',
+                            filterStatus === opt.value && 'bg-primary/5',
+                          )}
+                        >
+                          <span className="size-2.5 shrink-0" />
+                          <span className="min-w-0 flex-1 truncate text-start">
+                            {opt.label}
+                          </span>
+                          {filterStatus === opt.value && (
+                            <Check size={13} className="text-primary" />
+                          )}
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuSubContent>
+                  </DropdownMenuPortal>
+                </DropdownMenuSub>
+
+                {/* Ignored rows: a visibility switch rather than a filter
+                    value, so it reads as one line instead of a submenu. */}
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault()
+                    onHideIgnoredChange(!hideIgnored)
+                  }}
+                  className="gap-2 text-[13px]"
+                >
+                  <EyeClosed size={14} className="text-muted-foreground" />
+                  <span className="flex-1">{t('transactions.hideIgnored')}</span>
+                  {hideIgnored && <Check size={13} className="text-primary" />}
+                </DropdownMenuItem>
+
+                {/* Flagged rows, optionally by reminder date */}
+                <DropdownMenuSub>
+                  <DropdownMenuSubTrigger className="gap-2 text-[13px]">
+                    <Flag size={14} className="text-muted-foreground" />
+                    <span className="flex-1">{t('transactions.flagged')}</span>
+                    {flagLabel && (
+                      <span className="max-w-[90px] truncate text-[11px] text-muted-foreground">
+                        {flagLabel}
+                      </span>
+                    )}
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuPortal>
+                    <DropdownMenuSubContent
+                      sideOffset={8}
+                      className="w-[220px] p-1"
+                    >
+                      {flagOptions.map((opt) => (
+                        <DropdownMenuItem
+                          key={opt.value || 'any'}
+                          onSelect={() => onFlagFilterChange(opt.value)}
+                          className={cn(
+                            'gap-2 rounded-sm px-2 py-1.5 text-[13px]',
+                            filterFlag === opt.value && 'bg-primary/5',
+                          )}
+                        >
+                          <span className="size-2.5 shrink-0" />
+                          <span className="min-w-0 flex-1 truncate text-start">
+                            {opt.label}
+                          </span>
+                          {filterFlag === opt.value && (
                             <Check size={13} className="text-primary" />
                           )}
                         </DropdownMenuItem>
@@ -666,7 +1023,7 @@ export function TransactionsFilterBar({
                         )}
                       >
                         <span className="size-2.5 shrink-0" />
-                        <span className="min-w-0 flex-1 truncate text-left">
+                        <span className="min-w-0 flex-1 truncate text-start">
                           {t('transactions.all')}
                         </span>
                         {!filterFrom && !filterTo && (
@@ -689,7 +1046,7 @@ export function TransactionsFilterBar({
                             )}
                           >
                             <span className="size-2.5 shrink-0" />
-                            <span className="min-w-0 flex-1 truncate text-left">
+                            <span className="min-w-0 flex-1 truncate text-start">
                               {preset.label}
                             </span>
                             {active && <Check size={13} className="text-primary" />}
@@ -751,7 +1108,7 @@ export function TransactionsFilterBar({
                                 applyAmountRange()
                               }
                             }}
-                            className="h-8 w-full rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-primary/60 focus:ring-[2px] focus:ring-primary/15"
+                            className="h-8 w-full rounded-md border border-border bg-card px-2 text-[13px] outline-none focus:border-primary/60 focus:ring-[2px] focus:ring-primary/15"
                           />
                         </div>
                         <div className="flex-1">
@@ -772,7 +1129,7 @@ export function TransactionsFilterBar({
                                 applyAmountRange()
                               }
                             }}
-                            className="h-8 w-full rounded-md border border-border bg-background px-2 text-[13px] outline-none focus:border-primary/60 focus:ring-[2px] focus:ring-primary/15"
+                            className="h-8 w-full rounded-md border border-border bg-card px-2 text-[13px] outline-none focus:border-primary/60 focus:ring-[2px] focus:ring-primary/15"
                           />
                         </div>
                       </div>
@@ -822,6 +1179,7 @@ export function TransactionsFilterBar({
                   </DropdownMenuItem>
                 </>
               )}
+              </div>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -829,10 +1187,13 @@ export function TransactionsFilterBar({
 
         {/* Bottom row: active filter chips (only when any are set) */}
         {(filterAccountIds.length > 0 ||
+          filterLinkedCardIds.length > 0 ||
           filterCategoryIds.length > 0 ||
           filterUncategorized ||
           !!selectedPayee ||
           !!typeLabel ||
+          !!statusLabel ||
+          !!flagLabel ||
           !!dateLabel ||
           !!amountLabel) && (
           <div className="flex flex-wrap items-center gap-1 border-t border-border/60 px-2 py-1.5">
@@ -847,6 +1208,23 @@ export function TransactionsFilterBar({
                   value={getAccountName(account)}
                   onRemove={() =>
                     onAccountIdsChange(filterAccountIds.filter((x) => x !== id))
+                  }
+                />
+              )
+            })}
+            {filterLinkedCardIds.map((id) => {
+              const card = linkedCardById.get(id)
+              if (!card) return null
+              return (
+                <FilterChip
+                  key={`card-${id}`}
+                  icon={<CreditCard size={12} />}
+                  label={t('transactions.card')}
+                  value={linkedCardLabel(card)}
+                  onRemove={() =>
+                    onLinkedCardIdsChange(
+                      filterLinkedCardIds.filter((cardId) => cardId !== id),
+                    )
                   }
                 />
               )
@@ -893,6 +1271,30 @@ export function TransactionsFilterBar({
                 onRemove={() => onTypeChange('')}
               />
             )}
+            {statusLabel && (
+              <FilterChip
+                icon={<ListChecks size={12} />}
+                label={t('transactions.status')}
+                value={statusLabel}
+                onRemove={() => onStatusChange('')}
+              />
+            )}
+            {hideIgnored && (
+              <FilterChip
+                icon={<EyeClosed size={12} />}
+                label={t('transactions.hideIgnored')}
+                value={t('transactions.ignoredHiddenValue')}
+                onRemove={() => onHideIgnoredChange(false)}
+              />
+            )}
+            {flagLabel && (
+              <FilterChip
+                icon={<Flag size={12} />}
+                label={t('transactions.flagged')}
+                value={flagLabel}
+                onRemove={() => onFlagFilterChange('')}
+              />
+            )}
             {dateLabel && (
               <FilterChip
                 icon={<CalendarIcon size={12} />}
@@ -927,12 +1329,12 @@ export function TransactionsFilterBar({
             </p>
             <p className="mt-0.5 text-[11px] text-muted-foreground/70">
               {draftFrom || draftTo
-                ? formatRange(draftFrom, draftTo, dateLocale)
+                ? formatDateRange(draftFrom, draftTo, dateLocale)
                 : t('transactions.filtersBar.pickRange')}
             </p>
           </div>
           <div className="flex flex-col gap-4 p-3 sm:flex-row sm:gap-0">
-            <div className="sm:border-r sm:border-border/60 sm:pr-2">
+            <div className="sm:border-e sm:border-border/60 sm:pe-2">
               <p className="px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/80">
                 {t('transactions.filtersBar.fromLabel')}
               </p>
@@ -942,10 +1344,10 @@ export function TransactionsFilterBar({
                   draftFrom ? new Date(draftFrom + 'T00:00:00') : new Date()
                 }
                 locale={dateFnsLocale}
-                onSelect={(d) => setDraftFrom(d ? toISODate(d) : '')}
+                onSelect={(d) => setDraftFrom(d ? localDateString(d) : '')}
               />
             </div>
-            <div className="sm:pl-2">
+            <div className="sm:ps-2">
               <p className="px-2 pb-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/80">
                 {t('transactions.filtersBar.toLabel')}
               </p>
@@ -959,7 +1361,7 @@ export function TransactionsFilterBar({
                       : new Date()
                 }
                 locale={dateFnsLocale}
-                onSelect={(d) => setDraftTo(d ? toISODate(d) : '')}
+                onSelect={(d) => setDraftTo(d ? localDateString(d) : '')}
               />
             </div>
           </div>
@@ -1009,18 +1411,6 @@ export function TransactionsFilterBar({
   )
 }
 
-function formatRange(from: string, to: string, locale: string): string {
-  const fmt = (iso: string) =>
-    new Date(iso + 'T00:00:00').toLocaleDateString(locale, {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-    })
-  if (from && to) return `${fmt(from)} — ${fmt(to)}`
-  if (from) return `≥ ${fmt(from)}`
-  return `≤ ${fmt(to)}`
-}
-
 interface FilterChipProps {
   icon: React.ReactNode
   label: string
@@ -1034,7 +1424,7 @@ function FilterChip({ icon, label, value, tint, onRemove }: FilterChipProps) {
     <button
       type="button"
       onClick={onRemove}
-      className="group inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-muted/50 pl-2 pr-1.5 text-[11.5px] text-foreground transition-colors hover:border-destructive/40 hover:bg-destructive/5"
+      className="group inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-muted/50 ps-2 pe-1.5 text-[11.5px] text-foreground transition-colors hover:border-destructive/40 hover:bg-destructive/5"
       style={tint ? { borderColor: `${tint}55`, backgroundColor: `${tint}12` } : undefined}
     >
       <span
@@ -1047,7 +1437,7 @@ function FilterChip({ icon, label, value, tint, onRemove }: FilterChipProps) {
       <span className="max-w-[140px] truncate font-medium text-foreground">
         {value}
       </span>
-      <span className="ml-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground/70 group-hover:text-destructive">
+      <span className="ms-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground/70 group-hover:text-destructive">
         <X size={11} />
       </span>
     </button>

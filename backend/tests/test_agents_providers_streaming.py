@@ -1,5 +1,5 @@
 """Coverage for the streaming chat + embed paths in
-app/agents/providers/{ollama,anthropic}.py. Both providers open
+app/agents/providers/{openai,ollama,anthropic}.py. These providers open
 httpx.AsyncClient.stream(...) inline, so we replace AsyncClient with a
 fake whose stream() yields a pre-baked SSE/JSONL response.
 """
@@ -23,6 +23,8 @@ from app.agents.providers.base import (
     ToolDefinition,
 )
 from app.agents.providers.ollama import OllamaProvider
+from app.agents.providers.openai import OpenAIProvider
+from app.agents.providers.openai_compatible import OpenAICompatibleProvider
 
 
 # --------------------------------------------------------------------- httpx fake
@@ -87,6 +89,137 @@ def _fake_httpx(monkeypatch):
     monkeypatch.setattr(ollama_module.httpx, "AsyncClient", _FakeAsyncClient)
     monkeypatch.setattr(anthropic_module.httpx, "AsyncClient", _FakeAsyncClient)
     yield
+
+
+# --------------------------------------------------------------------- OpenAI-compatible: chat_stream
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "base_url", "with_tools", "uses_gpt6_parameters"),
+    [
+        ("gpt-6-luna", "https://api.openai.com/v1", True, True),
+        ("gpt-6-sol", "https://api.openai.com/v1", True, True),
+        ("gpt-6-luna", "https://api.openai.com/v1", False, True),
+        ("gpt-6-luna", "https://compatible.example/v1", True, False),
+        ("gpt-4o-mini", "https://api.openai.com/v1", True, False),
+    ],
+)
+async def test_openai_chat_completions_gpt6_parameters(
+    model, base_url, with_tools, uses_gpt6_parameters,
+):
+    _FakeAsyncClient.queue_stream.append(_FakeStreamResponse(status_code=200, lines=[
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+        "data: [DONE]",
+    ]))
+    tools = [ToolDefinition(name="get_budget", description="Read budget", parameters={"type": "object"})]
+    provider = OpenAIProvider(base_url=base_url)
+    await provider.chat(
+        [ChatMessage(role="user", content="Check my budget")],
+        model=model,
+        tools=tools if with_tools else None,
+        max_tokens=64,
+    )
+
+    url, payload = _FakeAsyncClient.posted[-1]
+    assert url == f"{base_url}/chat/completions"
+    assert ("tools" in payload) == with_tools
+    if uses_gpt6_parameters:
+        assert payload["reasoning_effort"] == "none"
+        assert payload["max_completion_tokens"] == 64
+        assert "max_tokens" not in payload
+    else:
+        assert "reasoning_effort" not in payload
+        assert "max_completion_tokens" not in payload
+        assert payload["max_tokens"] == 64
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_class", [OpenAICompatibleProvider, OpenAIProvider])
+@pytest.mark.parametrize("signature_timing", ["first", "late", "absent"])
+async def test_openai_tool_signatures_survive_multiple_rounds(provider_class, signature_timing):
+    """Keep signatures on their own calls across parallel and sequential tools."""
+    def response(deltas):
+        return _FakeStreamResponse(status_code=200, lines=[
+            "data: " + json.dumps({"choices": [{"delta": delta}]}) for delta in deltas
+        ] + ['data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}', "data: [DONE]"])
+
+    signature_a = "opaque-A+/=="
+    first = {"index": 0, "id": "a", "function": {"name": "lookup", "arguments": '{"city":'}}
+    extra_a = {"google": {"thought_signature": signature_a}}
+    if signature_timing == "first":
+        first["extra_content"] = extra_a
+    deltas = [
+        {"tool_calls": [first]},
+        {"tool_calls": [{"index": 1, "id": "b", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"tool_calls": [{"index": 0, "function": {"arguments": '"Paris"}'}}]},
+    ]
+    if signature_timing == "late":
+        deltas.append({"tool_calls": [{"index": 0, "extra_content": extra_a}]})
+    second_call = {"index": 0, "id": "c", "function": {"name": "lookup", "arguments": "{}"}}
+    if signature_timing != "absent":
+        second_call["extra_content"] = {"google": {"thought_signature": "opaque-B=="}}
+    _FakeAsyncClient.queue_stream.extend([
+        response(deltas), response([{"tool_calls": [second_call]}]),
+        response([{"content": "Done"}]),
+    ])
+    provider = provider_class(base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+    messages = [ChatMessage(role="user", content="Look up cities")]
+    for round_index in range(2):
+        result = await provider.chat(messages, model="gemini-test")
+        if round_index == 0:
+            assert [tc.id for tc in result.tool_calls] == ["a", "b"]
+            assert result.tool_calls[0].arguments == {"city": "Paris"}
+        messages.append(ChatMessage(role="assistant", tool_calls=result.tool_calls))
+        messages.extend(ChatMessage(role="tool", tool_call_id=tc.id, content="ok") for tc in result.tool_calls)
+    await provider.chat(messages, model="gemini-test")
+
+    assert len(_FakeAsyncClient.posted) == 3
+    for url, payload in _FakeAsyncClient.posted:
+        assert url == "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        for message in payload["messages"]:
+            for call in message.get("tool_calls", []):
+                if signature_timing == "absent" or call["id"] == "b":
+                    assert set(call) == {"id", "type", "function"}
+                else:
+                    expected = signature_a if call["id"] == "a" else "opaque-B=="
+                    assert call["extra_content"] == {"google": {"thought_signature": expected}}
+    final_calls = [tc for m in _FakeAsyncClient.posted[-1][1]["messages"] for tc in m.get("tool_calls", [])]
+    assert [tc["id"] for tc in final_calls] == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_class", [OpenAICompatibleProvider, OpenAIProvider])
+async def test_openai_tool_calls_without_index_stay_apart(provider_class):
+    """Gemini's OpenAI endpoint streams tool calls with no `index` (#1318).
+
+    A new id opens a new call and a delta with no id continues the last one,
+    even when it carries the rest of the name. Keying a missing index as 0
+    glued both calls into `get_cashflow` with `{"months":12}{}`.
+    """
+    deltas = [
+        {"tool_calls": [{"id": "call_1", "function": {"name": "get_cash", "arguments": ""}}]},
+        {"tool_calls": [{"function": {"name": "flow", "arguments": '{"months":'}}]},
+        {"tool_calls": [{"function": {"arguments": "12}"}}]},
+        {"tool_calls": [{"id": "call_2", "function": {"name": "list_accounts", "arguments": "{}"}}]},
+    ]
+    _FakeAsyncClient.queue_stream.append(_FakeStreamResponse(status_code=200, lines=[
+        "data: " + json.dumps({"choices": [{"delta": delta}]}) for delta in deltas
+    ] + ['data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}', "data: [DONE]"]))
+    provider = provider_class(base_url="https://generativelanguage.googleapis.com/v1beta/openai")
+
+    result = await provider.chat([ChatMessage(role="user", content="How am I doing?")], model="gemini-test")
+
+    assert [(tc.id, tc.name, tc.arguments, tc.invalid_arguments) for tc in result.tool_calls] == [
+        ("call_1", "get_cashflow", {"months": 12}, None),
+        ("call_2", "list_accounts", {}, None),
+    ]
+
+
+@pytest.mark.parametrize("buf", ['{"months":12}{}', '{"months":', "[1, 2]"])
+def test_parse_tool_arguments_refuses_anything_but_one_object(buf):
+    from app.agents.providers.base import parse_tool_arguments
+
+    assert parse_tool_arguments(buf) == ({}, buf)
 
 
 # --------------------------------------------------------------------- Ollama: chat_stream
@@ -229,7 +362,7 @@ async def test_anthropic_chat_stream_parses_text_block_sequence():
 
     text = "".join(c.text or "" for c in chunks if c.type == "text_delta")
     assert text == "Hi!"
-    assert any(c.type == "usage" and c.usage.output_tokens == 2 for c in chunks)
+    assert any(c.type == "usage" and c.usage is not None and c.usage.output_tokens == 2 for c in chunks)
     assert any(c.type == "finish" and c.finish_reason == "end_turn" for c in chunks)
 
 
@@ -281,6 +414,18 @@ async def test_anthropic_includes_system_and_tools_in_payload():
     assert payload["system"] == "part1\n\npart2"
     assert payload["max_tokens"] == 200
     assert payload["tools"][0]["name"] == "t"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_payload_omits_temperature():
+    sse = [f"data: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}, 'usage': {}})}"]
+    _FakeAsyncClient.queue_stream.append(_FakeStreamResponse(status_code=200, lines=sse))
+    provider = AnthropicProvider(api_key="sk-test")
+    msgs = [ChatMessage(role="user", content="hi")]
+    async for _ in provider.chat_stream(msgs, model="claude-x", temperature=0.2):
+        pass
+    _, payload = _FakeAsyncClient.posted[-1]
+    assert "temperature" not in payload
 
 
 # --------------------------------------------------------------------- Anthropic: HTTP errors → typed exceptions

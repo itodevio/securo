@@ -64,21 +64,29 @@ export function OnboardingTour({ onComplete }: Props) {
   const step = STEPS[current]
   const pad = 6
 
-  // Tooltip position: to the right of the target element
+  // Tooltip position: to the right of the target element. A fixed width
+  // (never wider than the viewport) so the footer wraps inside the card
+  // instead of pushing a long label past its edge (issue #1036).
+  const tooltipWidth = Math.min(320, window.innerWidth - 16)
   const tooltipStyle: React.CSSProperties = rect
     ? {
         position: 'fixed',
         top: Math.max(8, Math.min(rect.top, window.innerHeight - 220)),
-        left: rect.right + 16,
+        left: Math.max(8, rect.right + 16),
         zIndex: 10001,
-        maxWidth: 320,
+        width: tooltipWidth,
       }
     : { display: 'none' }
 
-  // If tooltip would go off screen right, put it below instead
-  if (rect && rect.right + 16 + 320 > window.innerWidth) {
-    tooltipStyle.left = Math.max(8, rect.left)
-    tooltipStyle.top = rect.bottom + 12
+  // If tooltip would go off screen right, put it to the left of the target
+  // (right-to-left layouts, where the sidebar is on the right) or below it.
+  if (rect && rect.right + 16 + tooltipWidth > window.innerWidth) {
+    if (rect.left - 16 - tooltipWidth >= 8) {
+      tooltipStyle.left = rect.left - 16 - tooltipWidth
+    } else {
+      tooltipStyle.left = Math.max(8, Math.min(rect.left, window.innerWidth - tooltipWidth - 8))
+      tooltipStyle.top = Math.max(8, Math.min(rect.bottom + 12, window.innerHeight - 220))
+    }
   }
 
   return (
@@ -139,11 +147,11 @@ export function OnboardingTour({ onComplete }: Props) {
             </span>
           </div>
           <p className="text-sm text-muted-foreground leading-relaxed">{t(step.descKey)}</p>
-          <div className="flex items-center justify-between pt-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
             <Button variant="ghost" size="sm" onClick={onComplete} className="text-muted-foreground">
               {t('onboarding.skip')}
             </Button>
-            <div className="flex gap-2">
+            <div className="ms-auto flex gap-2">
               {current > 0 && (
                 <Button variant="outline" size="sm" onClick={back}>
                   {t('onboarding.back')}

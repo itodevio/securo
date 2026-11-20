@@ -26,6 +26,10 @@ class AgentCreate(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
     auto_context: bool = True
     is_default: bool = False
+    # Optional tool whitelist written in the same transaction as the agent,
+    # so an agent created with a tool scope never exists without it. Left
+    # out (None), the agent keeps the allow-all default.
+    tools: Optional[list["AgentToolToggle"]] = None
 
 
 class AgentUpdate(BaseModel):
@@ -48,8 +52,9 @@ class AgentUpdate(BaseModel):
 
 
 class AgentToolToggle(BaseModel):
-    server: str
-    tool_name: str
+    # The lengths of agent_tools.server and agent_tools.tool_name.
+    server: str = Field(..., min_length=1, max_length=500)
+    tool_name: str = Field(..., min_length=1, max_length=255)
     enabled: bool
 
 

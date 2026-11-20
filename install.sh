@@ -104,37 +104,6 @@ is_docker_compose_v2() {
   command -v docker-compose > /dev/null 2>&1 && docker-compose version 2>/dev/null | grep -Eq 'Docker Compose version v?2|v2'
 }
 
-version_at_least() {
-  local version="${1%%[-+]*}"
-  local minimum="${2%%[-+]*}"
-  local IFS=.
-  local -a version_parts minimum_parts
-  local version_part minimum_part i
-
-  [ -n "$version" ] || return 1
-
-  read -r -a version_parts <<< "$version"
-  read -r -a minimum_parts <<< "$minimum"
-
-  for i in 0 1 2; do
-    version_part="${version_parts[$i]:-0}"
-    minimum_part="${minimum_parts[$i]:-0}"
-    version_part="${version_part//[^0-9]/}"
-    minimum_part="${minimum_part//[^0-9]/}"
-    version_part="${version_part:-0}"
-    minimum_part="${minimum_part:-0}"
-
-    if ((10#$version_part > 10#$minimum_part)); then
-      return 0
-    fi
-    if ((10#$version_part < 10#$minimum_part)); then
-      return 1
-    fi
-  done
-
-  return 0
-}
-
 check_podman_compose_version() {
   local pc_version
 
@@ -142,10 +111,6 @@ check_podman_compose_version() {
   # podman-compose version; target the compose line explicitly.
   pc_version=$(podman-compose --version 2>&1 | grep -i 'podman-compose version' | awk '{print $NF}' || true)
   info "podman-compose ${pc_version:-unknown} found"
-
-  if [ -n "$pc_version" ] && ! version_at_least "$pc_version" "1.0.6"; then
-    warn "podman-compose $pc_version is old. Upgrade to >= 1.0.6 (ideally 1.5+) for reliable healthcheck support."
-  fi
 }
 
 resolve_compose_command() {
@@ -296,17 +261,22 @@ generate_env() {
 
   if command -v openssl &> /dev/null; then
     SECRET_KEY=$(openssl rand -hex 32)
+    MCP_JWT_SECRET=$(openssl rand -hex 32)
   else
     SECRET_KEY=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n')
+    MCP_JWT_SECRET=$(head -c 32 /dev/urandom | xxd -p | tr -d '\n')
   fi
 
   cat > .env <<EOF
 SECRET_KEY=$SECRET_KEY
+# Signs the optional AI Agents MCP server's tokens. Generated now so enabling
+# Agents later needs no extra step. Rotating it invalidates MCP tokens.
+AGENTS_MCP_JWT_SECRET=$MCP_JWT_SECRET
 PLUGGY_CLIENT_ID=
 PLUGGY_CLIENT_SECRET=
 EOF
 
-  success ".env file created with a random SECRET_KEY"
+  success ".env file created with a random SECRET_KEY and MCP signing key"
 }
 
 # ── Start Services ───────────────────────────────────────────────────────────

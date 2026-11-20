@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.accounts import router as accounts_router
 from app.api.budgets import router as budgets_router
+from app.api.backups import router as backups_router
 from app.api.goals import router as goals_router
 from app.api.groups import router as groups_router
 from app.api.categories import router as categories_router
@@ -18,9 +19,11 @@ from app.api.dashboard import router as dashboard_router
 from app.api.import_logs import router as import_logs_router
 from app.api.oidc_auth import router as oidc_auth_router
 from app.api.passkeys import router as passkeys_router
+from app.api.forecast import router as forecast_router
 from app.api.import_transactions import router as import_router
 from app.api.info import router as info_router
 from app.api.recurring_transactions import router as recurring_router
+from app.api.reconciliation import router as reconciliation_router
 from app.api.rules import router as rules_router
 from app.api.assets import router as assets_router
 from app.api.asset_groups import router as asset_groups_router
@@ -32,14 +35,26 @@ from app.api.currencies import router as currencies_router
 from app.api.export import router as export_router
 from app.api.fx_rates import router as fx_rates_router
 from app.api.attachments import router as attachments_router
+from app.api.fiscal import router as fiscal_router
+from app.api.invoice_attachments import router as invoice_attachments_router
+from app.api.invoice_schedules import router as invoice_schedules_router
+from app.api.invoices import router as invoices_router
+from app.api.mortgage_payments import router as mortgage_payments_router
+from app.api.products import router as products_router
+from app.api.public_invoices import router as public_invoices_router
 from app.api.payees import router as payees_router
 from app.api.settings import router as settings_router
+from app.api.timezones import router as timezones_router
 from app.api.transactions import router as transactions_router
 from app.api.two_factor import router as two_factor_router
 from app.api.user_lookup import router as user_lookup_router
 from app.api.workspaces import router as workspaces_router
+from app.api.access_tokens import router as access_tokens_router
+from app.api.plugins import router as plugins_router
+from app.api.ui_layouts import router as ui_layouts_router
 from app.api.admin import router as admin_router, check_registration_enabled
 from app.core.auth import fastapi_users
+from app.core.auth_policy import require_local_auth_enabled
 from app.core.config import get_settings
 from app.core.rate_limit import login_rate_limit, register_rate_limit, password_reset_rate_limit
 from app.core.redis import close_redis
@@ -62,6 +77,7 @@ async def _warm_tesouro_cache() -> None:
             return
         from sqlalchemy import select
 
+        from app.core.app_clock import get_timezone, use_resolved_timezone
         from app.core.database import async_session_maker
         from app.models.workspace import Workspace
 
@@ -69,19 +85,43 @@ async def _warm_tesouro_cache() -> None:
             has_brl = await session.scalar(
                 select(Workspace.id).where(Workspace.default_currency == "BRL").limit(1)
             )
-        if not has_brl:
-            return
+            if not has_brl:
+                return
+            operation_timezone = await get_timezone(session)
 
         from app.providers.tesouro_direto import get_tesouro_direto_provider
 
-        await get_tesouro_direto_provider().get_available_bonds()
-        logger.info("Startup: warmed Tesouro Direto price cache")
+        with use_resolved_timezone(operation_timezone):
+            await get_tesouro_direto_provider().get_available_bonds()
+            logger.info("Startup: warmed Tesouro Direto price cache")
     except Exception:
         logger.exception("Startup: Tesouro Direto cache warm failed")
 
 
+async def _load_stored_secret_key() -> None:
+    from app.core.config import load_stored_secret_key
+
+    for _ in range(60):
+        if await asyncio.to_thread(load_stored_secret_key):
+            return
+        await asyncio.sleep(5)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Agents on means the API mints MCP tokens and the MCP server accepts
+    # them. Refuse to start when the signing key is a public default: every
+    # token would be forgeable, and the failure is otherwise silent until
+    # someone uses it (issue #1174).
+    if os.getenv("AGENTS_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+        from app.agents.mcp.keys import resolve_mcp_jwt_secret
+
+        resolve_mcp_jwt_secret()
+
+    # Old credentials may need the instance key as a fallback; read it off
+    # the event loop, and keep trying while the database comes up.
+    app.state.stored_key_task = asyncio.create_task(_load_stored_secret_key())
+
     # Startup: dispatch sync for all stale bank connections
     try:
         from app.worker import celery_app  # noqa: F811
@@ -135,13 +175,17 @@ app.include_router(
     fastapi_users.get_register_router(UserRead, UserCreate),
     prefix="/api/auth",
     tags=["auth"],
-    dependencies=[Depends(check_registration_enabled), Depends(register_rate_limit)],
+    dependencies=[
+        Depends(require_local_auth_enabled),
+        Depends(check_registration_enabled),
+        Depends(register_rate_limit),
+    ],
 )
 app.include_router(
     fastapi_users.get_reset_password_router(),
     prefix="/api/auth",
     tags=["auth"],
-    dependencies=[Depends(password_reset_rate_limit)],
+    dependencies=[Depends(require_local_auth_enabled), Depends(password_reset_rate_limit)],
 )
 # user_lookup must precede the fastapi-users router below so the
 # `/api/users/lookup` path isn't captured by the catch-all `/{id}`
@@ -157,13 +201,17 @@ app.include_router(
 app.include_router(categories_router)
 app.include_router(category_groups_router)
 app.include_router(rules_router)
+app.include_router(reconciliation_router)
 app.include_router(transactions_router)
+app.include_router(mortgage_payments_router)
 app.include_router(import_router)
 app.include_router(import_logs_router)
 app.include_router(accounts_router)
 app.include_router(connections_router)
 app.include_router(recurring_router)
+app.include_router(forecast_router)
 app.include_router(budgets_router)
+
 app.include_router(goals_router)
 app.include_router(groups_router)
 app.include_router(assets_router)
@@ -174,12 +222,23 @@ app.include_router(reports_router)
 app.include_router(search_router)
 app.include_router(setup_router)
 app.include_router(currencies_router)
+app.include_router(timezones_router)
 app.include_router(fx_rates_router)
 app.include_router(export_router)
+app.include_router(backups_router)
 app.include_router(attachments_router)
+app.include_router(fiscal_router)
 app.include_router(payees_router)
+app.include_router(invoices_router)
+app.include_router(invoice_attachments_router)
+app.include_router(invoice_schedules_router)
+app.include_router(public_invoices_router)
+app.include_router(products_router)
 app.include_router(settings_router)
 app.include_router(workspaces_router)
+app.include_router(access_tokens_router)
+app.include_router(plugins_router)
+app.include_router(ui_layouts_router)
 app.include_router(admin_router)
 app.include_router(info_router)
 
@@ -215,3 +274,31 @@ if os.getenv("AGENTS_ENABLED", "false").strip().lower() in ("1", "true", "yes", 
 @app.get("/api/health")
 async def health_check():
     return {"status": "healthy"}
+
+
+# Serve the built SPA from this process. Inert unless FRONTEND_DIST_PATH
+# points at a real directory, so the published backend image, which contains
+# no frontend build, behaves exactly as before.
+#
+# `app.frontend()` rather than mounting StaticFiles at "/": a Mount at the
+# root matches every path, so an unknown /api/... would be answered with
+# index.html and HTTP 200 instead of a JSON 404, and the trailing-slash
+# redirect would never be reached. The frontend route is low-priority (it is
+# consulted after every real route, after 405 handling, and after the
+# redirect) and its index.html fallback only fires for requests that accept
+# text/html. A caveat worth knowing: that makes `curl /transactions` a 404,
+# because curl sends `Accept: */*`. Health checks should use /api/health.
+_frontend_dist = settings.frontend_dist_path.strip()
+if _frontend_dist and os.path.isdir(_frontend_dist):
+    from app.core.spa import FrontendCacheHeadersMiddleware
+
+    app.add_middleware(FrontendCacheHeadersMiddleware)
+    # The isdir() above is the check; check_dir would only re-run it and
+    # raise at import time on a race.
+    app.frontend("/", directory=_frontend_dist, check_dir=False)
+    logger.info("Serving the frontend in-process from %s", _frontend_dist)
+elif _frontend_dist:
+    logger.warning(
+        "FRONTEND_DIST_PATH=%s is not a directory; the frontend is not served",
+        _frontend_dist,
+    )

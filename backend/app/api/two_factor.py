@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import datetime
 
 import pyotp
 from fastapi import APIRouter, Depends, HTTPException
@@ -7,7 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import current_active_user, get_jwt_strategy
+from app.core.auth_policy import require_local_auth_enabled
 from app.core.database import get_async_session
+from app.core.rate_limit import login_rate_limit
 from app.core.redis import get_redis
 from app.models.user import User
 from app.schemas.two_factor import (
@@ -18,6 +21,19 @@ from app.schemas.two_factor import (
 )
 
 router = APIRouter()
+TOTP_VALID_WINDOW = 1
+
+
+def _verify_totp(secret: str, code: str, for_time: datetime | None = None) -> bool:
+    """Check a code against now, accepting the tick before and after it.
+
+    `for_time` only exists so a test can pin the clock through pyotp's own
+    API: patching the clock it reads internally does not survive a release
+    that changes how pyotp gets the current time.
+    """
+    return pyotp.TOTP(secret).verify(
+        code, for_time=for_time, valid_window=TOTP_VALID_WINDOW
+    )
 
 
 def _parse_temp_token_payload(raw: str | bytes) -> dict[str, object] | None:
@@ -33,11 +49,20 @@ def _parse_temp_token_payload(raw: str | bytes) -> dict[str, object] | None:
     return payload
 
 
-@router.post("/2fa/setup", response_model=TwoFactorSetupResponse)
+@router.post(
+    "/2fa/setup",
+    response_model=TwoFactorSetupResponse,
+    dependencies=[Depends(require_local_auth_enabled)],
+)
 async def setup_2fa(
     user: User = Depends(current_active_user),
     session: AsyncSession = Depends(get_async_session),
 ):
+    # Replacing the secret of an enrolled account has to go through /2fa/disable,
+    # which checks the password and a current code.
+    if user.is_2fa_enabled:
+        raise HTTPException(status_code=409, detail="2FA is already enabled")
+
     secret = pyotp.random_base32()
     user.totp_secret = secret
     session.add(user)
@@ -49,7 +74,7 @@ async def setup_2fa(
     return TwoFactorSetupResponse(secret=secret, otpauth_uri=otpauth_uri)
 
 
-@router.post("/2fa/enable")
+@router.post("/2fa/enable", dependencies=[Depends(require_local_auth_enabled)])
 async def enable_2fa(
     body: TwoFactorEnableRequest,
     user: User = Depends(current_active_user),
@@ -58,8 +83,7 @@ async def enable_2fa(
     if not user.totp_secret:
         raise HTTPException(status_code=400, detail="Call /2fa/setup first")
 
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(body.code):
+    if not _verify_totp(user.totp_secret, body.code):
         raise HTTPException(status_code=400, detail="Invalid 2FA code")
 
     user.is_2fa_enabled = True
@@ -91,8 +115,7 @@ async def disable_2fa(
     if not user.totp_secret:
         raise HTTPException(status_code=400, detail="2FA is not set up")
 
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(body.code):
+    if not _verify_totp(user.totp_secret, body.code):
         raise HTTPException(status_code=400, detail="Invalid 2FA code")
 
     user.totp_secret = None
@@ -102,7 +125,7 @@ async def disable_2fa(
     return {"detail": "2FA disabled"}
 
 
-@router.post("/2fa/verify")
+@router.post("/2fa/verify", dependencies=[Depends(login_rate_limit)])
 async def verify_2fa(
     body: TwoFactorVerifyRequest,
     session: AsyncSession = Depends(get_async_session),
@@ -126,8 +149,7 @@ async def verify_2fa(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     # Verify TOTP
-    totp = pyotp.TOTP(user.totp_secret)
-    if not totp.verify(body.code):
+    if not _verify_totp(user.totp_secret, body.code):
         raise HTTPException(status_code=400, detail="Invalid 2FA code")
 
     # Delete temp token

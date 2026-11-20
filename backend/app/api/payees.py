@@ -3,6 +3,7 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_async_session
@@ -11,11 +12,48 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
-from app.schemas.payee import PayeeCreate, PayeeMergeRequest, PayeeRead, PayeeSummary, PayeeUpdate
+from app.schemas.payee import PayeeCreate, PayeeMergeRequest, PayeeRead, PayeeSummary, PayeeUpdate, PayeeBulkDeleteRequest
 from app.schemas.category import CategoryRead
 from app.services import payee_service
 
 router = APIRouter(prefix="/api/payees", tags=["payees"])
+
+
+def _payee_in_use(error: ValueError) -> HTTPException:
+    """Turn "this counterparty is still referenced" into an answer.
+
+    Invoices hold their payee under a RESTRICT foreign key on purpose:
+    deleting a client must never silently delete the record of money they
+    owed. Without this the constraint surfaces as a 500, which tells the
+    user nothing and tells the operator that something crashed.
+
+    409 rather than 400: the request is well formed and the refusal is
+    about the state of the data, which is exactly what Conflict means.
+    """
+    reason = str(error)
+    if reason.startswith("payee_has_invoices:"):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "payee_has_invoices",
+                "count": int(reason.split(":", 1)[1] or 0),
+                # The way out, named: merging keeps the history, which is
+                # what someone deleting a duplicate actually wants.
+                "message": "This client has invoices. Merge it into another client instead.",
+            },
+        )
+    if reason.startswith("payee_has_schedules:"):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "payee_has_schedules",
+                "count": int(reason.split(":", 1)[1] or 0),
+                # A schedule is a live agreement, so the merge cannot
+                # carry it. The user has to end or move it first.
+                "message": "This client has recurring invoices. End the agreement before merging.",
+            },
+        )
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=reason)
 
 
 @router.get("", response_model=list[PayeeRead])
@@ -99,7 +137,10 @@ async def delete_payee(
     ctx: WorkspaceContext = Depends(current_writable_workspace),
     session: AsyncSession = Depends(get_async_session),
 ):
-    deleted = await payee_service.delete_payee(session, payee_id, ctx.workspace.id)
+    try:
+        deleted = await payee_service.delete_payee(session, payee_id, ctx.workspace.id)
+    except ValueError as exc:
+        raise _payee_in_use(exc)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payee not found")
 
@@ -114,4 +155,31 @@ async def merge_payees(
         reassigned = await payee_service.merge_payees(session, ctx.workspace.id, data.target_id, data.source_ids)
         return {"merged": len(data.source_ids), "transactions_reassigned": reassigned}
     except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        raise _payee_in_use(e)
+    except IntegrityError as exc:
+        # Two merges into one target can each move a document of the same
+        # kind; the second commit then trips uq_payee_tax_id_kind. Only that
+        # one is worth a retry: any other violation (a source still linked
+        # to an invoice schedule, say) fails the same way again.
+        await session.rollback()
+        if "uq_payee_tax_id_kind" not in str(exc.orig):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Payee merge conflicted with a concurrent change. Retry the merge.",
+        ) from exc
+
+
+@router.post("/bulk-delete", status_code=status.HTTP_200_OK)
+async def bulk_delete_payees(
+    data: PayeeBulkDeleteRequest,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    try:
+        deleted_count = await payee_service.bulk_delete_payees(
+            session, ctx.workspace.id, data.ids
+        )
+    except ValueError as exc:
+        raise _payee_in_use(exc)
+    return {"deleted": deleted_count}

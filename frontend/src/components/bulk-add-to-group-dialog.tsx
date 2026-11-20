@@ -297,7 +297,7 @@ function BulkAddToGroupForm({
                 </button>
               </div>
               <select
-                className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-background"
+                className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-card"
                 value={groupId}
                 onChange={(e) => setExplicitGroupId(e.target.value)}
               >
@@ -309,7 +309,7 @@ function BulkAddToGroupForm({
             <div className="space-y-1">
               <Label className="text-xs">{t('splitGroups.shareType')}</Label>
               <select
-                className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-background"
+                className="w-full border border-border rounded-md px-2 py-1.5 text-sm bg-card"
                 value={shareType}
                 onChange={(e) => setShareType(e.target.value as BulkShareType)}
               >
@@ -340,7 +340,7 @@ function BulkAddToGroupForm({
           </div>
 
           {group && (
-            <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-64 overflow-y-auto pe-1">
               {group.members.length === 0 ? (
                 <div className="py-4 text-center">
                   <p className="text-sm text-muted-foreground mb-3">
@@ -377,7 +377,7 @@ function BulkAddToGroupForm({
                       <span className="text-sm flex-1 min-w-0 truncate">
                         {m.name}
                         {m.is_self && (
-                          <span className="ml-1.5 text-xs text-primary">
+                          <span className="ms-1.5 text-xs text-primary">
                             ({t('splitGroups.you')})
                           </span>
                         )}
