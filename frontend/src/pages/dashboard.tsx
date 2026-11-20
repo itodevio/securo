@@ -426,6 +426,70 @@ export default function DashboardPage() {
     onError: (err: unknown) => toast.error(extractApiError(err, t('common.error'))),
   })
 
+  // The queue only fixes the order. A save can change other rows (a quick pick, or
+  // an installment saved for the whole series), so each row is re-read before it
+  // opens. Shared rows belong to another workspace and can't be re-read here.
+  const refreshTx = (tx: Transaction) => (tx.is_shared ? Promise.resolve(tx) : transactions.get(tx.id))
+
+  const findNextToEdit = async (id: string, request: number) => {
+    const start = editQueue.findIndex((tx) => tx.id === id)
+    if (start < 0) return null
+    for (const queued of editQueue.slice(start + 1)) {
+      let fresh: Transaction
+      try {
+        fresh = await refreshTx(queued)
+      } catch (err) {
+        // A row deleted since the panel loaded is skipped. Any other failure stops
+        // here; the row is still in the panel to open again.
+        if ((err as { response?: { status?: number } })?.response?.status === 404) continue
+        if (request === openRequest.current) toast.error(extractApiError(err, t('common.error')))
+        return null
+      }
+      // A row categorized or ignored since the panel loaded no longer belongs in
+      // "Categorize now" (the panel lists neither).
+      if (drillDown?.uncategorized && (fresh.category_id || fresh.is_ignored || isSplitByCategory(fresh))) continue
+      return fresh
+    }
+    return null
+  }
+
+  // Only the latest click opens: an older, slower read must not replace it. Closing
+  // the dialog also moves it on, so a late "Save & next" can't reopen anything.
+  const openRequest = useRef(0)
+  const openFromDrillDown = async (tx: Transaction, queue: Transaction[]) => {
+    const request = ++openRequest.current
+    try {
+      const fresh = await refreshTx(tx)
+      if (request !== openRequest.current) return
+      setEditQueue(queue)
+      setEditingTx(fresh)
+      setDialogOpen(true)
+    } catch (err) {
+      if (request === openRequest.current) toast.error(extractApiError(err, t('common.error')))
+    }
+  }
+
+  // Kept apart from the save, so a lookup the user walked away from can't keep
+  // a newly opened dialog busy.
+  const [loadingNext, setLoadingNext] = useState(false)
+
+  const closeEditDialog = () => {
+    openRequest.current++
+    setLoadingNext(false)
+    setDialogOpen(false)
+    setEditingTx(null)
+    setEditQueue([])
+  }
+
+  const openNextAfterSave = async (id: string, request: number) => {
+    setLoadingNext(true)
+    const next = await findNextToEdit(id, request)
+    if (request !== openRequest.current) return
+    setLoadingNext(false)
+    if (next) setEditingTx(next)
+    else closeEditDialog()
+  }
+
   const updateMutation = useMutation({
     mutationFn: ({ id, ...data }: TransactionSavePayload & { id: string; action?: SaveAction }) => {
       // `action` only steers what happens after the save; it is not a field.
@@ -433,16 +497,13 @@ export default function DashboardPage() {
       delete payload.action
       return transactions.update(id, payload)
     },
-    onSuccess: (_saved, { id, action }) => {
+    onMutate: () => openRequest.current,
+    onSuccess: (_saved, { id, action }, request) => {
       invalidateFinancialQueries(queryClient)
-      const next = action === 'saveAndNext' ? nextInQueue(id) : null
-      if (next) {
-        setEditingTx(next)
-        return
-      }
-      setDialogOpen(false)
-      setEditingTx(null)
-      setEditQueue([])
+      // The dialog was closed (and maybe another row opened) during the save.
+      if (request !== openRequest.current) return
+      if (action === 'saveAndNext') void openNextAfterSave(id, request)
+      else closeEditDialog()
     },
   })
 
@@ -450,9 +511,7 @@ export default function DashboardPage() {
     mutationFn: (id: string) => transactions.delete(id),
     onSuccess: () => {
       invalidateFinancialQueries(queryClient)
-      setDialogOpen(false)
-      setEditingTx(null)
-      setEditQueue([])
+      closeEditDialog()
     },
   })
 
@@ -460,9 +519,7 @@ export default function DashboardPage() {
     mutationFn: (pairId: string) => transactions.unlinkTransfer(pairId),
     onSuccess: () => {
       invalidateFinancialQueries(queryClient)
-      setDialogOpen(false)
-      setEditingTx(null)
-      setEditQueue([])
+      closeEditDialog()
     },
   })
 
@@ -1989,8 +2046,8 @@ export default function DashboardPage() {
             }
             : null
         }
-        onClose={() => setDrillDown(null)}
-        onTransactionClick={(tx, queue) => { setEditQueue(queue); setEditingTx(tx); setDialogOpen(true) }}
+        onClose={() => { openRequest.current++; setDrillDown(null) }}
+        onTransactionClick={openFromDrillDown}
         quickCategorize={canWrite ? {
           categories: categoriesList ?? [],
           groups: categoryGroupsList ?? [],
@@ -2001,7 +2058,7 @@ export default function DashboardPage() {
 
       <TransactionDialog
         open={dialogOpen}
-        onClose={() => { setDialogOpen(false); setEditingTx(null); setEditQueue([]) }}
+        onClose={closeEditDialog}
         transaction={editingTx}
         hasNext={!!editingTx && !!nextInQueue(editingTx.id)}
         categories={categoriesList ?? []}
@@ -2022,12 +2079,10 @@ export default function DashboardPage() {
         }}
         onUnlinkTransfer={(pairId) => unlinkTransferMutation.mutate(pairId)}
         onCreateRule={(tx) => {
-          setDialogOpen(false)
-          setEditingTx(null)
-          setEditQueue([])
+          closeEditDialog()
           handleCreateRuleFromTransaction(tx)
         }}
-        loading={updateMutation.isPending || deleteMutation.isPending || unlinkTransferMutation.isPending}
+        loading={updateMutation.isPending || loadingNext || deleteMutation.isPending || unlinkTransferMutation.isPending}
         error={updateMutation.error ? extractApiError(updateMutation.error) : deleteMutation.error ? extractApiError(deleteMutation.error) : null}
         isSynced={editingTx?.source === 'sync'}
       />

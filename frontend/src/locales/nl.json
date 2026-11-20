@@ -2118,9 +2118,10 @@
     "summaryHoldings": "{{created}} holdings gemaakt, {{matched}} gematcht",
     "summarySkipped": "{{count}} is al geïmporteerd",
     "rowsSkipped": "{{count}} rijen worden overgeslagen",
+    "reasonColumn": "Reden",
     "rowError": "Rij {{row}} ({{ticker}}): {{reason}}",
     "moreErrors": "en {{count}} meer",
-    "moreRows": "en {{count}} meer bestellingen",
+    "showAllRows": "Alle {{count}} rijen tonen",
     "field": {
       "ticker": "Tikker",
       "date": "Datum",
@@ -2423,7 +2424,41 @@
     "statementViewTransactions": "Transacties bekijken",
     "statementUncategorizedIncome": "Inkomsten zonder categorie",
     "statementUncategorizedExpense": "Uitgaven zonder categorie",
-    "statementToggleGroup": "Categorieën van {{name}} tonen"
+    "statementToggleGroup": "Categorieën van {{name}} tonen",
+    "pluginReport": {
+      "total": {
+        "expenses": "Totaal uitgegeven",
+        "income": "Totaal ontvangen",
+        "net": "Saldo"
+      },
+      "none": {
+        "category": "Zonder categorie",
+        "category_group": "Zonder groep",
+        "payee": "Zonder begunstigde",
+        "account": "Zonder rekening",
+        "month": "Zonder datum"
+      },
+      "groupBy": {
+        "category": "Categorie",
+        "category_group": "Groep",
+        "payee": "Begunstigde",
+        "account": "Rekening",
+        "month": "Maand"
+      },
+      "measure": {
+        "expenses": "Uitgaven",
+        "income": "Inkomsten",
+        "net": "Saldo"
+      },
+      "share": "Aandeel",
+      "computed": "Berekend door de plugin",
+      "periodTrimmed": "Plugin-rapporten beslaan maximaal twee jaar. Getoond: {{from}} tot {{to}}.",
+      "periodTooLong": "Een plugin-rapport beslaat maximaal twee jaar. Kies een kortere periode.",
+      "totalRow": "Totaal",
+      "page": "Pagina {{page}} van {{pages}}",
+      "previousPage": "Vorige pagina",
+      "nextPage": "Volgende pagina"
+    }
   },
   "payees": {
     "noPayeeFound": "Geen begunstigde gevonden.",
@@ -3969,8 +4004,7 @@
       "title": "Terugkerende omzet",
       "hint": "Wat terugkerende facturen per maand opleveren, en wat onlangs verloren ging."
     }
-  }
-,
+  },
   "offline": {
     "title": "Server niet bereikbaar",
     "description": "Je bent offline of Securo start opnieuw op. Je gegevens zijn veilig en er is niets gewijzigd. We maken automatisch opnieuw verbinding zodra de server antwoordt."
